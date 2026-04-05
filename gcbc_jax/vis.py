@@ -186,11 +186,6 @@ def visualize_predictions(agent, vis_trajs, step, save_dir, action_metadata, rng
 
         gt_actions = traj["actions"]  # raw (not normalized)
 
-        # Video: obs | goal
-        vis_frames = create_vis_frames(traj["obs_images"], traj["goal_image"])
-        gif_path = os.path.join(vis_dir, f"{traj['name']}_video.gif")
-        save_gif(vis_frames, gif_path, fps=fps)
-
         # Action comparison plot
         action_img, mse = create_action_plot(pred_actions, gt_actions, step)
         plot_path = os.path.join(vis_dir, f"{traj['name']}_actions.png")
@@ -198,8 +193,6 @@ def visualize_predictions(agent, vis_trajs, step, save_dir, action_metadata, rng
 
         if use_wandb:
             import wandb
-            video_arr = vis_frames.transpose(0, 3, 1, 2)  # (T, C, H, W)
-            wandb_logs[f"vis/ep{i}_video"] = wandb.Video(video_arr, fps=fps)
             wandb_logs[f"vis/ep{i}_actions"] = wandb.Image(action_img)
             wandb_logs[f"vis/ep{i}_mse"] = mse
 
