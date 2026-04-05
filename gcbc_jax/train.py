@@ -125,6 +125,28 @@ def train(args):
     print(f"Loaded {len(vis_trajs)} val trajectories for visualization")
     vis_rng = jax.random.PRNGKey(args.seed + 100)
 
+    # Resolve training mode (epoch vs step)
+    epoch_mode = args.num_epochs is not None
+    if epoch_mode:
+        num_epochs = args.num_epochs
+        steps_per_epoch = 0
+        for _ in train_data.tf_dataset:
+            steps_per_epoch += 1
+        total_steps = num_epochs * steps_per_epoch
+        log_interval = args.log_interval * steps_per_epoch
+        eval_interval = (args.eval_interval or 5) * steps_per_epoch
+        save_interval = (args.save_interval or 5) * steps_per_epoch
+        print(f"\nEpoch mode: {num_epochs} epochs × {steps_per_epoch} steps/epoch "
+              f"= {total_steps} total steps")
+        print(f"  log every {args.log_interval} epoch(s), eval every {args.eval_interval or 5} "
+              f"epoch(s), save every {args.save_interval or 5} epoch(s)")
+    else:
+        total_steps = args.num_steps or 100000
+        log_interval = args.log_interval
+        eval_interval = args.eval_interval or 5000
+        save_interval = args.save_interval or 5000
+        print(f"\nStep mode: {total_steps} total steps")
+
     train_data_iter = map(shard_fn, train_data.tf_dataset.as_numpy_iterator())
 
     # Get example batch for agent initialization
@@ -166,7 +188,7 @@ def train(args):
         ),
         learning_rate=args.lr,
         warmup_steps=args.warmup_steps,
-        decay_steps=args.num_steps,
+        decay_steps=total_steps,
     )
 
     # Replicate across devices
@@ -181,8 +203,8 @@ def train(args):
         wandb.init(project=args.wandb_project, name=args.run_name, config=vars(args))
 
     # Training loop
-    print(f"\nStarting training for {args.num_steps} steps...")
-    for i in tqdm.tqdm(range(int(args.num_steps))):
+    print(f"Starting training...")
+    for i in tqdm.tqdm(range(total_steps)):
         try:
             batch = next(train_data_iter)
         except StopIteration:
@@ -191,8 +213,10 @@ def train(args):
 
         agent, update_info = agent.update(batch)
 
+        step = i + 1
+
         # Logging
-        if (i + 1) % args.log_interval == 0:
+        if step % log_interval == 0:
             info = jax.device_get(update_info)
             log_dict = {}
             for k, v in info.items():
@@ -202,13 +226,18 @@ def train(args):
                     pass
             if args.use_wandb:
                 import wandb
-                wandb.log({f"training/{k}": v for k, v in log_dict.items()}, step=i + 1)
-            if (i + 1) % (args.log_interval * 10) == 0:
-                print(f"Step {i+1}: loss={log_dict.get('actor_loss', 'N/A'):.4f} "
+                wandb.log({f"training/{k}": v for k, v in log_dict.items()}, step=step)
+            if epoch_mode:
+                epoch = step // steps_per_epoch
+                print(f"Epoch {epoch}/{num_epochs} (step {step}): "
+                      f"loss={log_dict.get('actor_loss', 'N/A'):.4f} "
+                      f"mse={log_dict.get('mse', 'N/A'):.4f}", flush=True)
+            elif step % (log_interval * 10) == 0:
+                print(f"Step {step}: loss={log_dict.get('actor_loss', 'N/A'):.4f} "
                       f"mse={log_dict.get('mse', 'N/A'):.4f}", flush=True)
 
         # Validation
-        if (i + 1) % args.eval_interval == 0:
+        if step % eval_interval == 0:
             val_metrics = []
             val_data_iter = map(shard_fn, val_data.iterator())
             for val_batch in val_data_iter:
@@ -222,15 +251,15 @@ def train(args):
                         val_log[k] = float(v)
                     except (TypeError, ValueError):
                         pass
-                print(f"  Val step {i+1}: {val_log}", flush=True)
+                print(f"  Val step {step}: {val_log}", flush=True)
                 if args.use_wandb:
                     import wandb
-                    wandb.log({f"validation/{k}": v for k, v in val_log.items()}, step=i + 1)
+                    wandb.log({f"validation/{k}": v for k, v in val_log.items()}, step=step)
 
             # Visualization on fixed val trajectories
             if vis_trajs:
                 vis_rng = visualize_predictions(
-                    agent, vis_trajs, step=i + 1,
+                    agent, vis_trajs, step=step,
                     save_dir=args.save_dir,
                     action_metadata=action_proprio_metadata,
                     rng=vis_rng,
@@ -241,15 +270,15 @@ def train(args):
                 )
 
         # Checkpointing (flax msgpack, avoids orbax version issues)
-        if (i + 1) % args.save_interval == 0:
-            ckpt_path = os.path.join(args.save_dir, f"checkpoint_{i + 1}")
+        if step % save_interval == 0:
+            ckpt_path = os.path.join(args.save_dir, f"checkpoint_{step}")
             agent_cpu = jax.device_get(jax.tree_map(np.array, agent))
             with open(ckpt_path, "wb") as f:
                 f.write(serialization.to_bytes(agent_cpu))
-            print(f"  Checkpoint saved at step {i+1}", flush=True)
+            print(f"  Checkpoint saved at step {step}", flush=True)
 
     # Final checkpoint
-    ckpt_path = os.path.join(args.save_dir, f"checkpoint_{int(args.num_steps)}")
+    ckpt_path = os.path.join(args.save_dir, f"checkpoint_{total_steps}")
     agent_cpu = jax.device_get(jax.tree_map(np.array, agent))
     with open(ckpt_path, "wb") as f:
         f.write(serialization.to_bytes(agent_cpu))
@@ -268,7 +297,10 @@ def main():
     parser.add_argument("--run_name", type=str, default="gcbc_jax")
     parser.add_argument("--encoder", type=str, default="resnetv1-34-bridge")
 
-    parser.add_argument("--num_steps", type=int, default=100000)
+    parser.add_argument("--num_steps", type=int, default=None,
+                        help="Total training steps (step mode, default)")
+    parser.add_argument("--num_epochs", type=int, default=None,
+                        help="Total training epochs (epoch mode)")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--warmup_steps", type=int, default=2000)
@@ -283,9 +315,12 @@ def main():
     parser.add_argument("--normalize_proprio", action="store_true",
                         help="Normalize proprio to [-1,1] using JOINT_RANGE bounds")
 
-    parser.add_argument("--log_interval", type=int, default=100)
-    parser.add_argument("--eval_interval", type=int, default=5000)
-    parser.add_argument("--save_interval", type=int, default=5000)
+    parser.add_argument("--log_interval", type=int, default=100,
+                        help="Log every N steps (step mode) or N epochs (epoch mode)")
+    parser.add_argument("--eval_interval", type=int, default=None,
+                        help="Eval every N steps/epochs (default: 5000 steps or 5 epochs)")
+    parser.add_argument("--save_interval", type=int, default=None,
+                        help="Save every N steps/epochs (default: 5000 steps or 5 epochs)")
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="gcbc-ispatialgym")
 
