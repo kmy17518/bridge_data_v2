@@ -1,7 +1,7 @@
 #!/bin/bash
 # Setup script for gcbc_torch (PyTorch GC-BC for ISpatialGym)
 #
-# Creates a conda env "torchrl" with PyTorch (CUDA 12.6, B300-compatible)
+# Creates a conda env "torchrl" with PyTorch (CUDA 12.8, B300/Blackwell-compatible)
 # and all dependencies needed for training and evaluation.
 #
 # Usage:
@@ -26,9 +26,9 @@ fi
 eval "$(conda shell.bash hook)"
 conda activate "${ENV_NAME}"
 
-# PyTorch with CUDA 12.6 (supports RTX 4090 + B300/Blackwell)
-echo "Installing PyTorch (CUDA 12.6)..."
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+# PyTorch with CUDA 12.8 (supports B300/Blackwell sm_103)
+echo "Installing PyTorch (CUDA 12.8)..."
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 
 # TensorFlow (for TFRecord data loading only, CPU is fine)
 echo "Installing TensorFlow..."
