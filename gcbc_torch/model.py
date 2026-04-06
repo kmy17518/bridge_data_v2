@@ -255,7 +255,8 @@ class GCBCPolicy(nn.Module):
 
         return means, log_stds
 
-    def get_action(self, obs_image, goal_image, proprio=None, argmax=True):
+    def get_action(self, obs_image, goal_image, proprio=None, argmax=True,
+                   target_state_dict=None):
         """Get action for inference (no grad, eval mode).
 
         Args:
@@ -263,6 +264,7 @@ class GCBCPolicy(nn.Module):
             goal_image: (B, H, W, 3) uint8
             proprio: optional (B, D)
             argmax: if True, return mean; else sample
+            target_state_dict: ignored (accepted for API compat with diffusion)
 
         Returns:
             actions: (B, action_dim)

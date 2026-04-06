@@ -1,15 +1,24 @@
-"""Train GC-BC using PyTorch with custom ISpatialGym data.
+"""Train GC-BC / GC-DDPM-BC using PyTorch with custom ISpatialGym data.
 
-Functionally identical to gcbc_jax/train.py but using PyTorch instead of JAX.
+Supports both GCBC (deterministic) and DDPM diffusion policies.
 
 Usage:
+    # GCBC (default)
     python -m gcbc_torch.train \
         --tfrecord_dir gcbc_jax/tfrecords/task-0053-final \
         --save_dir outputs/gcbc_torch_task0053 \
         --num_steps 50000
+
+    # Diffusion policy
+    python -m gcbc_torch.train \
+        --policy gc_ddpm_bc \
+        --tfrecord_dir gcbc_jax/tfrecords/task-0053-final \
+        --save_dir outputs/ddpm_torch_task0053 \
+        --num_steps 50000
 """
 
 import argparse
+import copy
 import glob
 import json
 import math
@@ -22,6 +31,7 @@ import torch
 import tqdm
 
 from .dataset import build_tf_dataset, load_raw_trajectories, tf_batch_to_torch
+from .diffusion_model import GCDDPMBCPolicy
 from .model import GCBCPolicy
 from .vis import visualize_predictions
 
@@ -156,16 +166,35 @@ def train(args):
         proprio_dim = 23
 
     # Create model
-    model = GCBCPolicy(
-        action_dim=action_dim,
-        use_proprio=args.use_proprio,
-        proprio_dim=proprio_dim if args.use_proprio else 23,
-        hidden_dims=(256, 256, 256),
-        dropout_rate=0.1,
-    ).to(device)
+    if args.policy == "gc_ddpm_bc":
+        model = GCDDPMBCPolicy(
+            action_dim=action_dim,
+            use_proprio=args.use_proprio,
+            proprio_dim=proprio_dim if args.use_proprio else 23,
+            diffusion_steps=args.diffusion_steps,
+            beta_schedule="cosine",
+            time_dim=32,
+            num_blocks=3,
+            hidden_dim=256,
+            dropout_rate=0.1,
+            use_layer_norm=True,
+        ).to(device)
+    else:
+        model = GCBCPolicy(
+            action_dim=action_dim,
+            use_proprio=args.use_proprio,
+            proprio_dim=proprio_dim if args.use_proprio else 23,
+            hidden_dims=(256, 256, 256),
+            dropout_rate=0.1,
+        ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {n_params:,}")
+    print(f"Model parameters: {n_params:,} (policy={args.policy})")
+
+    # EMA target network for diffusion
+    target_state_dict = None
+    if args.policy == "gc_ddpm_bc":
+        target_state_dict = copy.deepcopy(model.state_dict())
 
     # Optimizer: Adam with warmup + cosine decay (matching JAX)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -182,6 +211,8 @@ def train(args):
             model.load_state_dict(ckpt["model_state_dict"])
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            if target_state_dict is not None and "target_state_dict" in ckpt:
+                target_state_dict = ckpt["target_state_dict"]
             start_step = ckpt["step"]
             print(f"Resumed from {ckpt_path} at step {start_step}")
 
@@ -219,6 +250,13 @@ def train(args):
         loss.backward()
         optimizer.step()
         scheduler.step()
+
+        # EMA target network update for diffusion
+        if target_state_dict is not None:
+            tau = args.target_update_rate
+            with torch.no_grad():
+                for k in target_state_dict:
+                    target_state_dict[k].lerp_(model.state_dict()[k], tau)
 
         step = i + 1
         metrics["lr"] = scheduler.get_last_lr()[0]
@@ -272,6 +310,7 @@ def train(args):
                     use_proprio=args.use_proprio,
                     add_eef=args.add_eef_proprio,
                     normalize_proprio=args.normalize_proprio,
+                    target_state_dict=target_state_dict,
                 )
 
             model.train()
@@ -279,24 +318,30 @@ def train(args):
         # Checkpointing
         if step % save_interval == 0:
             ckpt_path = os.path.join(args.save_dir, f"checkpoint_{step}.pt")
-            torch.save({
+            ckpt_data = {
                 "step": step,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "args": vars(args),
-            }, ckpt_path)
+            }
+            if target_state_dict is not None:
+                ckpt_data["target_state_dict"] = target_state_dict
+            torch.save(ckpt_data, ckpt_path)
             print(f"  Checkpoint saved at step {step}", flush=True)
 
     # Final checkpoint
     ckpt_path = os.path.join(args.save_dir, f"checkpoint_{total_steps}.pt")
-    torch.save({
+    ckpt_data = {
         "step": total_steps,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "args": vars(args),
-    }, ckpt_path)
+    }
+    if target_state_dict is not None:
+        ckpt_data["target_state_dict"] = target_state_dict
+    torch.save(ckpt_data, ckpt_path)
     print(f"\nTraining complete. Checkpoints in {args.save_dir}")
 
     if args.use_wandb:
@@ -305,7 +350,10 @@ def train(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train GC-BC (PyTorch)")
+    parser = argparse.ArgumentParser(description="Train GC-BC / GC-DDPM-BC (PyTorch)")
+    parser.add_argument("--policy", type=str, default="gcbc",
+                        choices=["gcbc", "gc_ddpm_bc"],
+                        help="Policy type: gcbc (deterministic) or gc_ddpm_bc (diffusion)")
     parser.add_argument("--tfrecord_dir", type=str, required=True,
                         help="Directory with train/val TFRecords + action_proprio_metadata.json")
     parser.add_argument("--save_dir", type=str, default="outputs/gcbc_torch")
@@ -322,6 +370,12 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--augment", action="store_true", default=True)
     parser.add_argument("--no_augment", dest="augment", action="store_false")
+
+    # Diffusion-specific args
+    parser.add_argument("--diffusion_steps", type=int, default=20,
+                        help="Number of diffusion timesteps (gc_ddpm_bc only)")
+    parser.add_argument("--target_update_rate", type=float, default=0.002,
+                        help="EMA target network update rate (gc_ddpm_bc only)")
 
     parser.add_argument("--use_proprio", action="store_true",
                         help="Use 23-dim proprio (base_qvel, trunk, arms, grippers)")

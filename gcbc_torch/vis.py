@@ -29,7 +29,8 @@ ACTION_LABELS = [
 
 def run_trajectory_inference(model, traj, action_metadata, device,
                              use_proprio=False, add_eef=False,
-                             normalize_proprio=False, chunk_size=64):
+                             normalize_proprio=False, chunk_size=64,
+                             target_state_dict=None):
     """Run model on a full trajectory. Returns denormalized predictions."""
     obs_images = traj["obs_images"]   # (T, H, W, 3) uint8
     obs_state = traj["obs_state"]     # (T, 256) float32
@@ -57,7 +58,10 @@ def run_trajectory_inference(model, traj, action_metadata, device,
             ).to(device)
             chunk_proprio = torch.from_numpy(proprio[start:end]).to(device)
 
-            pred = model.get_action(chunk_obs, chunk_goal, chunk_proprio, argmax=True)
+            pred = model.get_action(
+                chunk_obs, chunk_goal, chunk_proprio, argmax=True,
+                target_state_dict=target_state_dict,
+            )
             all_pred.append(pred.cpu().numpy())
 
     pred_norm = np.concatenate(all_pred, axis=0)  # (T, action_dim)
@@ -115,7 +119,8 @@ def save_gif(frames, path, fps=10):
 
 def visualize_predictions(model, vis_trajs, step, save_dir, action_metadata,
                           device, use_wandb=False, use_proprio=False,
-                          add_eef=False, normalize_proprio=False):
+                          add_eef=False, normalize_proprio=False,
+                          target_state_dict=None):
     """Create and save visualizations for fixed validation trajectories."""
     vis_dir = os.path.join(save_dir, "vis", f"step_{step}")
     os.makedirs(vis_dir, exist_ok=True)
@@ -126,7 +131,8 @@ def visualize_predictions(model, vis_trajs, step, save_dir, action_metadata,
         pred_actions = run_trajectory_inference(
             model, traj, action_metadata, device,
             use_proprio=use_proprio, add_eef=add_eef,
-            normalize_proprio=normalize_proprio)
+            normalize_proprio=normalize_proprio,
+            target_state_dict=target_state_dict)
 
         gt_actions = traj["actions"]
 

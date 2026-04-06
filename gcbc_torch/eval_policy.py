@@ -1,7 +1,7 @@
 """PyTorch eval policy wrapper for eval_ispatialgym.py.
 
-Loads a trained PyTorch GCBCPolicy checkpoint and provides the
-forward(obs) -> torch.Tensor(23,) interface expected by OmniGibson.
+Loads a trained PyTorch GCBCPolicy or GCDDPMBCPolicy checkpoint and provides
+the forward(obs) -> torch.Tensor(23,) interface expected by OmniGibson.
 """
 
 import glob
@@ -12,12 +12,13 @@ import numpy as np
 import torch
 from PIL import Image
 
+from .diffusion_model import GCDDPMBCPolicy
 from .model import GCBCPolicy
 from .proprio import extract_proprio_np, normalize_proprio_bounds_np
 
 
 class TorchGCBCEvalPolicy:
-    """Wraps a PyTorch GCBCPolicy for use with eval_ispatialgym.py."""
+    """Wraps a PyTorch GCBCPolicy or GCDDPMBCPolicy for eval_ispatialgym.py."""
 
     def __init__(self, checkpoint_dir: str, goal_image_path: str,
                  use_proprio: bool = False, add_eef_proprio: bool = False,
@@ -44,23 +45,39 @@ class TorchGCBCEvalPolicy:
         goal_img = np.array(Image.open(goal_image_path).convert("RGB"))
         self.goal_image = goal_img  # uint8
 
-        # Create and load model
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = GCBCPolicy(
-            action_dim=action_dim,
-            use_proprio=use_proprio,
-            proprio_dim=proprio_dim,
-        ).to(self.device)
-
         # Find and load latest checkpoint
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         ckpt_files = glob.glob(os.path.join(checkpoint_dir, "checkpoint_*.pt"))
         assert ckpt_files, f"No checkpoints found in {checkpoint_dir}"
         ckpt_path = max(ckpt_files,
                         key=lambda p: int(os.path.basename(p).split("_")[1].split(".")[0]))
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(ckpt["model_state_dict"])
+
+        # Auto-detect policy type from checkpoint
+        ckpt_args = ckpt.get("args", {})
+        policy_type = ckpt_args.get("policy", "gcbc")
+
+        if policy_type == "gc_ddpm_bc":
+            self.model = GCDDPMBCPolicy(
+                action_dim=action_dim,
+                use_proprio=use_proprio,
+                proprio_dim=proprio_dim,
+                diffusion_steps=ckpt_args.get("diffusion_steps", 20),
+            ).to(self.device)
+            self.model.load_state_dict(ckpt["model_state_dict"])
+            self.target_state_dict = ckpt.get("target_state_dict")
+            print(f"Loaded PyTorch GCDDPMBCPolicy from {ckpt_path}")
+        else:
+            self.model = GCBCPolicy(
+                action_dim=action_dim,
+                use_proprio=use_proprio,
+                proprio_dim=proprio_dim,
+            ).to(self.device)
+            self.model.load_state_dict(ckpt["model_state_dict"])
+            self.target_state_dict = None
+            print(f"Loaded PyTorch GCBCPolicy from {ckpt_path}")
+
         self.model.eval()
-        print(f"Loaded PyTorch GCBCPolicy from {ckpt_path}")
         if use_proprio:
             print(f"  Proprio: {proprio_dim}-dim (add_eef={add_eef_proprio}, "
                   f"normalize={normalize_proprio})")
@@ -108,7 +125,10 @@ class TorchGCBCEvalPolicy:
 
         # Run inference
         with torch.no_grad():
-            actions = self.model.get_action(obs_t, goal_t, proprio_t, argmax=True)
+            actions = self.model.get_action(
+                obs_t, goal_t, proprio_t, argmax=True,
+                target_state_dict=self.target_state_dict,
+            )
 
         # Denormalize
         actions_np = actions[0].cpu().numpy()
