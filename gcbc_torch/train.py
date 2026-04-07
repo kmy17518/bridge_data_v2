@@ -30,8 +30,9 @@ import tensorflow as tf
 import torch
 import tqdm
 
-from .dataset import build_tf_dataset, load_raw_trajectories, tf_batch_to_torch
+from .dataset import build_tf_dataset, load_raw_trajectories, tf_batch_to_torch, tf_batch_to_torch_iql
 from .diffusion_model import GCDDPMBCPolicy
+from .iql_model import GCIQLPolicy
 from .model import GCBCPolicy
 from .vis import visualize_predictions
 
@@ -166,7 +167,19 @@ def train(args):
         proprio_dim = 23
 
     # Create model
-    if args.policy == "gc_ddpm_bc":
+    if args.policy == "gc_iql":
+        model = GCIQLPolicy(
+            action_dim=action_dim,
+            use_proprio=args.use_proprio,
+            proprio_dim=proprio_dim if args.use_proprio else 23,
+            hidden_dims=(256, 256, 256),
+            dropout_rate=0.1,
+            discount=args.discount,
+            expectile=args.expectile,
+            temperature=args.temperature,
+            negative_proportion=args.negative_proportion,
+        ).to(device)
+    elif args.policy == "gc_ddpm_bc":
         model = GCDDPMBCPolicy(
             action_dim=action_dim,
             use_proprio=args.use_proprio,
@@ -191,10 +204,16 @@ def train(args):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,} (policy={args.policy})")
 
-    # EMA target network for diffusion
+    # EMA target network
     target_state_dict = None
+    target_model = None
     if args.policy == "gc_ddpm_bc":
         target_state_dict = copy.deepcopy(model.state_dict())
+    elif args.policy == "gc_iql":
+        target_model = copy.deepcopy(model)
+        target_model.eval()
+        for p in target_model.parameters():
+            p.requires_grad_(False)
 
     # Optimizer: Adam with warmup + cosine decay (matching JAX)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -213,6 +232,8 @@ def train(args):
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
             if target_state_dict is not None and "target_state_dict" in ckpt:
                 target_state_dict = ckpt["target_state_dict"]
+            if target_model is not None and "target_state_dict" in ckpt:
+                target_model.load_state_dict(ckpt["target_state_dict"])
             start_step = ckpt["step"]
             print(f"Resumed from {ckpt_path} at step {start_step}")
 
@@ -234,16 +255,21 @@ def train(args):
             train_iter = iter(train_dataset.as_numpy_iterator())
             batch_np = next(train_iter)
 
-        batch = tf_batch_to_torch(batch_np, device)
+        if args.policy == "gc_iql":
+            batch = tf_batch_to_torch_iql(batch_np, device)
+        else:
+            batch = tf_batch_to_torch(batch_np, device)
 
         # Move to GPU
-        obs_image = batch["obs_image"].to(device)
-        goal_image = batch["goal_image"].to(device)
-        actions = batch["actions"].to(device)
-        proprio = batch["obs_proprio"].to(device) if args.use_proprio else None
-
-        # Forward + loss
-        loss, metrics = model.compute_loss(obs_image, goal_image, actions, proprio)
+        if args.policy == "gc_iql":
+            batch = {k: v.to(device) for k, v in batch.items()}
+            loss, metrics = model.compute_loss(batch, target_model)
+        else:
+            obs_image = batch["obs_image"].to(device)
+            goal_image = batch["goal_image"].to(device)
+            actions = batch["actions"].to(device)
+            proprio = batch["obs_proprio"].to(device) if args.use_proprio else None
+            loss, metrics = model.compute_loss(obs_image, goal_image, actions, proprio)
 
         # Backward
         optimizer.zero_grad()
@@ -251,12 +277,17 @@ def train(args):
         optimizer.step()
         scheduler.step()
 
-        # EMA target network update for diffusion
+        # EMA target network update
         if target_state_dict is not None:
             tau = args.target_update_rate
             with torch.no_grad():
                 for k in target_state_dict:
                     target_state_dict[k].lerp_(model.state_dict()[k], tau)
+        if target_model is not None:
+            tau = args.target_update_rate
+            with torch.no_grad():
+                for tp, mp in zip(target_model.parameters(), model.parameters()):
+                    tp.lerp_(mp, tau)
 
         step = i + 1
         metrics["lr"] = scheduler.get_last_lr()[0]
@@ -266,27 +297,38 @@ def train(args):
             if args.use_wandb:
                 import wandb
                 wandb.log({f"training/{k}": v for k, v in metrics.items()}, step=step)
+            loss_key = ("ddpm_loss" if args.policy == "gc_ddpm_bc"
+                        else "total_loss" if args.policy == "gc_iql"
+                        else "actor_loss")
+            loss_val = metrics[loss_key]
+            mse_val = metrics["mse"]
             if epoch_mode:
                 epoch = step // steps_per_epoch
                 print(f"Epoch {epoch}/{num_epochs} (step {step}): "
-                      f"loss={metrics['actor_loss']:.4f} "
-                      f"mse={metrics['mse']:.4f}", flush=True)
+                      f"loss={loss_val:.4f} mse={mse_val:.4f}", flush=True)
             elif step % (log_interval * 10) == 0:
-                print(f"Step {step}: loss={metrics['actor_loss']:.4f} "
-                      f"mse={metrics['mse']:.4f}", flush=True)
+                print(f"Step {step}: loss={loss_val:.4f} "
+                      f"mse={mse_val:.4f}", flush=True)
 
         # Validation
         if step % eval_interval == 0:
             model.eval()
             val_metrics_list = []
             for val_batch_np in val_dataset.as_numpy_iterator():
-                val_batch = tf_batch_to_torch(val_batch_np, device)
+                if args.policy == "gc_iql":
+                    val_batch = tf_batch_to_torch_iql(val_batch_np, device)
+                else:
+                    val_batch = tf_batch_to_torch(val_batch_np, device)
                 with torch.no_grad():
-                    v_obs = val_batch["obs_image"].to(device)
-                    v_goal = val_batch["goal_image"].to(device)
-                    v_actions = val_batch["actions"].to(device)
-                    v_proprio = val_batch["obs_proprio"].to(device) if args.use_proprio else None
-                    _, v_metrics = model.compute_loss(v_obs, v_goal, v_actions, v_proprio)
+                    if args.policy == "gc_iql":
+                        val_batch = {k: v.to(device) for k, v in val_batch.items()}
+                        _, v_metrics = model.compute_loss(val_batch, target_model)
+                    else:
+                        v_obs = val_batch["obs_image"].to(device)
+                        v_goal = val_batch["goal_image"].to(device)
+                        v_actions = val_batch["actions"].to(device)
+                        v_proprio = val_batch["obs_proprio"].to(device) if args.use_proprio else None
+                        _, v_metrics = model.compute_loss(v_obs, v_goal, v_actions, v_proprio)
                     val_metrics_list.append(v_metrics)
 
             if val_metrics_list:
@@ -327,6 +369,8 @@ def train(args):
             }
             if target_state_dict is not None:
                 ckpt_data["target_state_dict"] = target_state_dict
+            if target_model is not None:
+                ckpt_data["target_state_dict"] = target_model.state_dict()
             torch.save(ckpt_data, ckpt_path)
             print(f"  Checkpoint saved at step {step}", flush=True)
 
@@ -341,6 +385,8 @@ def train(args):
     }
     if target_state_dict is not None:
         ckpt_data["target_state_dict"] = target_state_dict
+    if target_model is not None:
+        ckpt_data["target_state_dict"] = target_model.state_dict()
     torch.save(ckpt_data, ckpt_path)
     print(f"\nTraining complete. Checkpoints in {args.save_dir}")
 
@@ -352,8 +398,8 @@ def train(args):
 def main():
     parser = argparse.ArgumentParser(description="Train GC-BC / GC-DDPM-BC (PyTorch)")
     parser.add_argument("--policy", type=str, default="gcbc",
-                        choices=["gcbc", "gc_ddpm_bc"],
-                        help="Policy type: gcbc (deterministic) or gc_ddpm_bc (diffusion)")
+                        choices=["gcbc", "gc_ddpm_bc", "gc_iql"],
+                        help="Policy type: gcbc, gc_ddpm_bc (diffusion), or gc_iql")
     parser.add_argument("--tfrecord_dir", type=str, required=True,
                         help="Directory with train/val TFRecords + action_proprio_metadata.json")
     parser.add_argument("--save_dir", type=str, default="outputs/gcbc_torch")
@@ -375,7 +421,17 @@ def main():
     parser.add_argument("--diffusion_steps", type=int, default=20,
                         help="Number of diffusion timesteps (gc_ddpm_bc only)")
     parser.add_argument("--target_update_rate", type=float, default=0.002,
-                        help="EMA target network update rate (gc_ddpm_bc only)")
+                        help="EMA target network update rate (gc_ddpm_bc / gc_iql)")
+
+    # IQL-specific args
+    parser.add_argument("--discount", type=float, default=0.98,
+                        help="Discount factor (gc_iql only)")
+    parser.add_argument("--expectile", type=float, default=0.7,
+                        help="Expectile for value loss (gc_iql only)")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Temperature for advantage weighting (gc_iql only)")
+    parser.add_argument("--negative_proportion", type=float, default=0.1,
+                        help="Proportion of negative goals (gc_iql only)")
 
     parser.add_argument("--use_proprio", action="store_true",
                         help="Use 23-dim proprio (base_qvel, trunk, arms, grippers)")

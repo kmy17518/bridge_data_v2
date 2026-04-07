@@ -13,6 +13,7 @@ import torch
 from PIL import Image
 
 from .diffusion_model import GCDDPMBCPolicy
+from .iql_model import GCIQLPolicy
 from .model import GCBCPolicy
 from .proprio import extract_proprio_np, normalize_proprio_bounds_np
 
@@ -57,7 +58,16 @@ class TorchGCBCEvalPolicy:
         ckpt_args = ckpt.get("args", {})
         policy_type = ckpt_args.get("policy", "gcbc")
 
-        if policy_type == "gc_ddpm_bc":
+        if policy_type == "gc_iql":
+            self.model = GCIQLPolicy(
+                action_dim=action_dim,
+                use_proprio=use_proprio,
+                proprio_dim=proprio_dim,
+            ).to(self.device)
+            self.model.load_state_dict(ckpt["model_state_dict"])
+            self.target_state_dict = ckpt.get("target_state_dict")
+            print(f"Loaded PyTorch GCIQLPolicy from {ckpt_path}")
+        elif policy_type == "gc_ddpm_bc":
             self.model = GCDDPMBCPolicy(
                 action_dim=action_dim,
                 use_proprio=use_proprio,

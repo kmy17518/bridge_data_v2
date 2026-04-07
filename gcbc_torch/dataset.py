@@ -188,6 +188,20 @@ def tf_batch_to_torch(batch, device="cpu"):
     }
 
 
+def tf_batch_to_torch_iql(batch, device="cpu"):
+    """Convert a TF batch (numpy) to PyTorch tensors, including IQL fields."""
+    return {
+        "obs_image": torch.from_numpy(batch["observations"]["image"]),
+        "goal_image": torch.from_numpy(batch["goals"]["image"]),
+        "obs_proprio": torch.from_numpy(batch["observations"]["proprio"]),
+        "next_obs_image": torch.from_numpy(batch["next_observations"]["image"]),
+        "next_obs_proprio": torch.from_numpy(batch["next_observations"]["proprio"]),
+        "actions": torch.from_numpy(batch["actions"]),
+        "rewards": torch.from_numpy(batch["rewards"].astype("float32")),
+        "masks": torch.from_numpy(batch["masks"].astype("float32")),
+    }
+
+
 def load_raw_trajectories(tfrecord_paths, n=3, seed=42):
     """Load n raw trajectories from TFRecords for visualization.
 
