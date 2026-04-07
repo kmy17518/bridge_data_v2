@@ -27,10 +27,12 @@ class FixedGoalBridgeDataset(BridgeDataset):
             to [-1, 1] using JOINT_RANGE / EEF_POSITION_RANGE bounds.
     """
 
-    # Extend PROTO_TYPE_SPEC with the goal_image field
+    # Extend PROTO_TYPE_SPEC with the goal_image field.
+    # Image fields store JPEG-compressed string tensors.
     PROTO_TYPE_SPEC = {
-        **BridgeDataset.PROTO_TYPE_SPEC,
-        "goal_image": tf.uint8,
+        **{k: (tf.string if v == tf.uint8 else v)
+           for k, v in BridgeDataset.PROTO_TYPE_SPEC.items()},
+        "goal_image": tf.string,
     }
 
     def __init__(self, *args, use_proprio=False, add_eef_proprio=False,
@@ -40,8 +42,17 @@ class FixedGoalBridgeDataset(BridgeDataset):
         self.normalize_proprio = normalize_proprio
         super().__init__(*args, **kwargs)
 
+    @staticmethod
+    def _decode_jpeg_frames(jpeg_tensor):
+        """Decode a 1-D string tensor of JPEG bytes into (T, H, W, 3) uint8."""
+        return tf.map_fn(
+            lambda j: tf.io.decode_jpeg(j, channels=3),
+            jpeg_tensor,
+            fn_output_signature=tf.uint8,
+        )
+
     def _decode_example(self, example_proto):
-        """Decode example including the fixed goal image."""
+        """Decode example including the fixed goal image (JPEG-compressed)."""
         features = {
             key: tf.io.FixedLenFeature([], tf.string)
             for key in self.PROTO_TYPE_SPEC.keys()
@@ -52,10 +63,14 @@ class FixedGoalBridgeDataset(BridgeDataset):
             for key, dtype in self.PROTO_TYPE_SPEC.items()
         }
 
+        obs_images = self._decode_jpeg_frames(parsed_tensors["observations/images0"])
+        next_obs_images = self._decode_jpeg_frames(
+            parsed_tensors["next_observations/images0"])
+        goal_image = tf.io.decode_jpeg(parsed_tensors["goal_image"], channels=3)
+
         obs_proprio = parsed_tensors["observations/state"]
         next_obs_proprio = parsed_tensors["next_observations/state"]
 
-        # Extract 23 or 37 dim proprio from 256-dim state
         if self.use_proprio:
             obs_proprio = extract_proprio_tf(
                 tf.cast(obs_proprio, tf.float32), add_eef=self.add_eef_proprio)
@@ -64,17 +79,17 @@ class FixedGoalBridgeDataset(BridgeDataset):
 
         return {
             "observations": {
-                "image": parsed_tensors["observations/images0"],
+                "image": obs_images,
                 "proprio": obs_proprio,
             },
             "next_observations": {
-                "image": parsed_tensors["next_observations/images0"],
+                "image": next_obs_images,
                 "proprio": next_obs_proprio,
             },
             "actions": parsed_tensors["actions"],
             "terminals": parsed_tensors["terminals"],
             "truncates": parsed_tensors["truncates"],
-            "goal_image": parsed_tensors["goal_image"],  # (H, W, 3) uint8
+            "goal_image": goal_image,
         }
 
     def _add_goals(self, traj):

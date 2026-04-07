@@ -38,16 +38,43 @@ def serialize_tensor(tensor):
     return tf.io.serialize_tensor(t).numpy()
 
 
+def serialize_jpeg_frames(frames, quality=95):
+    """JPEG-encode each frame and serialize as a 1-D string tensor.
+
+    Args:
+        frames: (T, H, W, 3) uint8 numpy array.
+        quality: JPEG quality (1-100). 95 gives <2/255 error per pixel.
+
+    Returns:
+        bytes: serialized 1-D tf.string tensor of JPEG byte strings.
+    """
+    jpeg_list = [
+        tf.io.encode_jpeg(tf.constant(frames[i]), quality=quality)
+        for i in range(frames.shape[0])
+    ]
+    return tf.io.serialize_tensor(tf.stack(jpeg_list)).numpy()
+
+
+def serialize_jpeg_single(image, quality=95):
+    """JPEG-encode a single image and serialize as a scalar string tensor."""
+    jpeg = tf.io.encode_jpeg(tf.constant(image), quality=quality)
+    return tf.io.serialize_tensor(jpeg).numpy()
+
+
 def make_example(obs_images, next_obs_images, obs_state, next_obs_state,
                  actions, terminals, truncates, goal_image):
-    """Create a tf.train.Example for one trajectory."""
+    """Create a tf.train.Example for one trajectory.
+
+    Image fields are stored as JPEG-compressed string tensors for ~10-15x
+    smaller files vs raw uint8. Non-image fields are unchanged.
+    """
     feature = {
         "observations/images0": tf.train.Feature(
-            bytes_list=tf.train.BytesList(value=[serialize_tensor(obs_images)])),
+            bytes_list=tf.train.BytesList(value=[serialize_jpeg_frames(obs_images)])),
         "observations/state": tf.train.Feature(
             bytes_list=tf.train.BytesList(value=[serialize_tensor(obs_state)])),
         "next_observations/images0": tf.train.Feature(
-            bytes_list=tf.train.BytesList(value=[serialize_tensor(next_obs_images)])),
+            bytes_list=tf.train.BytesList(value=[serialize_jpeg_frames(next_obs_images)])),
         "next_observations/state": tf.train.Feature(
             bytes_list=tf.train.BytesList(value=[serialize_tensor(next_obs_state)])),
         "actions": tf.train.Feature(
@@ -57,7 +84,7 @@ def make_example(obs_images, next_obs_images, obs_state, next_obs_state,
         "truncates": tf.train.Feature(
             bytes_list=tf.train.BytesList(value=[serialize_tensor(truncates)])),
         "goal_image": tf.train.Feature(
-            bytes_list=tf.train.BytesList(value=[serialize_tensor(goal_image)])),
+            bytes_list=tf.train.BytesList(value=[serialize_jpeg_single(goal_image)])),
     }
     return tf.train.Example(features=tf.train.Features(feature=feature))
 
