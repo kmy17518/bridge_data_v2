@@ -13,7 +13,7 @@ import torch
 from torch.utils.data import IterableDataset
 import torchvision.transforms.v2.functional as TF
 
-from .proprio import extract_proprio_tf, normalize_proprio_bounds_tf
+from .proprio import extract_proprio_tf, normalize_proprio_bounds_tf, normalize_actions_bounds_tf
 
 
 # TFRecord field types (same as jaxrl_m BridgeDataset + goal_image)
@@ -83,11 +83,13 @@ def _add_goals(traj):
     return traj
 
 
-def _normalize_actions(traj, action_proprio_metadata):
-    """Z-score normalize actions."""
-    traj["actions"] = (
-        traj["actions"] - action_proprio_metadata["action"]["mean"]
-    ) / action_proprio_metadata["action"]["std"]
+def _normalize_actions(traj):
+    """Normalize actions to [-1, 1] using JOINT_RANGE bounds.
+
+    Non-gripper dims: min-max normalization.
+    Gripper dims [14, 22]: pass through (already [-1, 1] in raw data).
+    """
+    traj["actions"] = normalize_actions_bounds_tf(traj["actions"])
     return traj
 
 
@@ -119,8 +121,8 @@ def _augment_images(seed, traj, augment_kwargs):
 
 
 def build_tf_dataset(tfrecord_paths, batch_size, seed, train=True,
-                     action_proprio_metadata=None, augment=True,
-                     augment_kwargs=None, shuffle_buffer_size=25000,
+                     augment=True, augment_kwargs=None,
+                     shuffle_buffer_size=25000,
                      use_proprio=False, add_eef_proprio=False,
                      normalize_proprio=False):
     """Build a tf.data.Dataset that yields batches of transitions.
@@ -142,11 +144,10 @@ def build_tf_dataset(tfrecord_paths, batch_size, seed, train=True,
                         add_eef_proprio=add_eef_proprio)
     dataset = dataset.map(decode_fn, num_parallel_calls=tf.data.AUTOTUNE)
 
-    # Normalize actions
-    if action_proprio_metadata is not None:
-        dataset = dataset.map(
-            lambda t: _normalize_actions(t, action_proprio_metadata),
-            num_parallel_calls=tf.data.AUTOTUNE)
+    # Normalize actions (always, using JOINT_RANGE bounds)
+    dataset = dataset.map(
+        lambda t: _normalize_actions(t),
+        num_parallel_calls=tf.data.AUTOTUNE)
 
     # Normalize proprio
     if use_proprio and normalize_proprio:

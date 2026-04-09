@@ -20,10 +20,8 @@ Usage:
 import argparse
 import copy
 import glob
-import json
 import math
 import os
-import shutil
 
 import numpy as np
 import tensorflow as tf
@@ -66,18 +64,6 @@ def train(args):
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # Load action normalization stats
-    stats_path = os.path.join(args.tfrecord_dir, "action_proprio_metadata.json")
-    with open(stats_path) as f:
-        action_proprio_metadata = json.load(f)
-    for key in action_proprio_metadata:
-        for stat in action_proprio_metadata[key]:
-            action_proprio_metadata[key][stat] = np.array(
-                action_proprio_metadata[key][stat], dtype=np.float32)
-
-    # Save metadata alongside checkpoint for eval
-    shutil.copy(stats_path, os.path.join(args.save_dir, "action_proprio_metadata.json"))
-
     # Find TFRecord paths
     train_paths = sorted(glob.glob(os.path.join(args.tfrecord_dir, "train", "*.tfrecord")))
     val_paths = sorted(glob.glob(os.path.join(args.tfrecord_dir, "val", "*.tfrecord")))
@@ -102,7 +88,6 @@ def train(args):
     # Build TF datasets for data loading
     train_dataset = build_tf_dataset(
         train_paths, args.batch_size, args.seed, train=True,
-        action_proprio_metadata=action_proprio_metadata,
         augment=args.augment, augment_kwargs=augment_kwargs,
         use_proprio=args.use_proprio, add_eef_proprio=args.add_eef_proprio,
         normalize_proprio=args.normalize_proprio,
@@ -110,7 +95,6 @@ def train(args):
 
     val_dataset = build_tf_dataset(
         val_paths, args.batch_size, args.seed + 1, train=False,
-        action_proprio_metadata=action_proprio_metadata,
         augment=False, augment_kwargs=None,
         use_proprio=args.use_proprio, add_eef_proprio=args.add_eef_proprio,
         normalize_proprio=args.normalize_proprio,
@@ -138,7 +122,6 @@ def train(args):
         # Rebuild train dataset since we consumed it counting steps
         train_dataset = build_tf_dataset(
             train_paths, args.batch_size, args.seed, train=True,
-            action_proprio_metadata=action_proprio_metadata,
             augment=args.augment, augment_kwargs=augment_kwargs,
             use_proprio=args.use_proprio, add_eef_proprio=args.add_eef_proprio,
             normalize_proprio=args.normalize_proprio,
@@ -346,7 +329,6 @@ def train(args):
                 visualize_predictions(
                     model, vis_trajs, step=step,
                     save_dir=args.save_dir,
-                    action_metadata=action_proprio_metadata,
                     device=device,
                     use_wandb=args.use_wandb,
                     use_proprio=args.use_proprio,
@@ -401,7 +383,7 @@ def main():
                         choices=["gcbc", "gc_ddpm_bc", "gc_iql"],
                         help="Policy type: gcbc, gc_ddpm_bc (diffusion), or gc_iql")
     parser.add_argument("--tfrecord_dir", type=str, required=True,
-                        help="Directory with train/val TFRecords + action_proprio_metadata.json")
+                        help="Directory with train/val TFRecords")
     parser.add_argument("--save_dir", type=str, default="outputs/gcbc_torch")
     parser.add_argument("--run_name", type=str, default="gcbc_torch")
     parser.add_argument("--encoder", type=str, default="resnetv1-34-bridge")

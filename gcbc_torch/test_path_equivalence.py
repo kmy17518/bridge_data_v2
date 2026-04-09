@@ -10,7 +10,6 @@ Usage:
 
 import argparse
 import glob
-import json
 import os
 import sys
 
@@ -44,18 +43,8 @@ def main():
     print(f"Checkpoint: {ckpt_path}")
     print(f"  use_proprio={use_proprio}, add_eef={add_eef}, normalize_proprio={normalize_proprio}")
 
-    # --- Load action metadata ---
-    stats_path = os.path.join(args.checkpoint_dir, "action_proprio_metadata.json")
-    with open(stats_path) as f:
-        action_proprio_metadata = json.load(f)
-    for key in action_proprio_metadata:
-        for stat in action_proprio_metadata[key]:
-            action_proprio_metadata[key][stat] = np.array(
-                action_proprio_metadata[key][stat], dtype=np.float32)
-
-    action_mean = action_proprio_metadata["action"]["mean"]
-    action_std = action_proprio_metadata["action"]["std"]
-    action_dim = len(action_mean)
+    from .proprio import ACTION_BOUNDS_LOW_23, denormalize_actions_bounds_np
+    action_dim = len(ACTION_BOUNDS_LOW_23)  # 23 for R1Pro
 
     # --- Load one val trajectory (same as vis.py: load_raw_trajectories) ---
     from .dataset import load_raw_trajectories
@@ -105,7 +94,7 @@ def main():
     with torch.no_grad():
         pred_norm_a = model.get_action(obs_t_a, goal_t_a, proprio_t_a, argmax=True)
     pred_norm_a = pred_norm_a[0].cpu().numpy()
-    action_a = pred_norm_a * action_std + action_mean
+    action_a = denormalize_actions_bounds_np(pred_norm_a)
 
     # =====================================================================
     # PATH B: eval_policy.py (TorchGCBCEvalPolicy.forward, simulated)
@@ -152,7 +141,7 @@ def main():
 
     # Step 6: denormalize
     actions_np_b = actions_b[0].cpu().numpy()
-    action_b = actions_np_b * action_std + action_mean
+    action_b = denormalize_actions_bounds_np(actions_np_b)
 
     # =====================================================================
     # COMPARE

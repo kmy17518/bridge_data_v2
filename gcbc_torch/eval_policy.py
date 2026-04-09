@@ -15,7 +15,10 @@ from PIL import Image
 from .diffusion_model import GCDDPMBCPolicy
 from .iql_model import GCIQLPolicy
 from .model import GCBCPolicy
-from .proprio import extract_proprio_np, normalize_proprio_bounds_np
+from .proprio import (
+    extract_proprio_np, normalize_proprio_bounds_np,
+    denormalize_actions_bounds_np, ACTION_BOUNDS_LOW_23,
+)
 
 
 class TorchGCBCEvalPolicy:
@@ -23,18 +26,22 @@ class TorchGCBCEvalPolicy:
 
     def __init__(self, checkpoint_dir: str, goal_image_path: str,
                  use_proprio: bool = False, add_eef_proprio: bool = False,
-                 normalize_proprio: bool = False):
+                 normalize_proprio: bool = False,
+                 action_metadata_path: str | None = None):
         self.use_proprio = use_proprio
         self.add_eef_proprio = add_eef_proprio
         self.normalize_proprio = normalize_proprio
+        self.action_metadata_path = action_metadata_path
 
-        # Load action normalization stats
-        stats_path = os.path.join(checkpoint_dir, "action_proprio_metadata.json")
-        with open(stats_path) as f:
-            self.metadata = json.load(f)
-        self.action_mean = np.array(self.metadata["action"]["mean"], dtype=np.float32)
-        self.action_std = np.array(self.metadata["action"]["std"], dtype=np.float32)
-        action_dim = len(self.action_mean)
+        # Load z-score stats for legacy checkpoints
+        if action_metadata_path is not None:
+            with open(action_metadata_path) as f:
+                metadata = json.load(f)
+            self.action_mean = np.array(metadata["action"]["mean"], dtype=np.float32)
+            self.action_std = np.array(metadata["action"]["std"], dtype=np.float32)
+            print(f"Loaded z-score action metadata from {action_metadata_path}")
+
+        action_dim = len(ACTION_BOUNDS_LOW_23)  # 23 for R1Pro
 
         # Determine proprio dimension
         if use_proprio:
@@ -129,6 +136,15 @@ class TorchGCBCEvalPolicy:
             proprio = extract_proprio_np(proprio_256, add_eef=self.add_eef_proprio)
             if self.normalize_proprio:
                 proprio = normalize_proprio_bounds_np(proprio, add_eef=self.add_eef_proprio)
+            if self.action_metadata_path is not None:
+                # Legacy order: base(3)+trunk(4)+arm_l(7)+arm_r(7)+grip_l(1)+grip_r(1)
+                # Current order: base(3)+trunk(4)+arm_l(7)+grip_l(1)+arm_r(7)+grip_r(1)
+                proprio = np.concatenate([
+                    proprio[..., :14],   # base(3)+trunk(4)+arm_left(7)
+                    proprio[..., 15:22], # arm_right(7)
+                    proprio[..., 14:15], # gripper_left(1)
+                    proprio[..., 22:23], # gripper_right(1)
+                ], axis=-1)
             proprio_t = torch.from_numpy(proprio[np.newaxis]).to(self.device)
         else:
             proprio_t = None
@@ -140,9 +156,12 @@ class TorchGCBCEvalPolicy:
                 target_state_dict=self.target_state_dict,
             )
 
-        # Denormalize
+        # Denormalize: z-score (legacy) or fixed joint-range bounds (default)
         actions_np = actions[0].cpu().numpy()
-        actions_denorm = actions_np * self.action_std + self.action_mean
+        if self.action_metadata_path is not None:
+            actions_denorm = actions_np * self.action_std + self.action_mean
+        else:
+            actions_denorm = denormalize_actions_bounds_np(actions_np)
 
         return torch.tensor(actions_denorm, dtype=torch.float32)
 

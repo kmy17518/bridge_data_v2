@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from .proprio import extract_proprio_np, normalize_proprio_bounds_np
+from .proprio import extract_proprio_np, normalize_proprio_bounds_np, denormalize_actions_bounds_np
 
 # R1Pro 23-dim action labels
 ACTION_LABELS = [
@@ -27,7 +27,7 @@ ACTION_LABELS = [
 ]
 
 
-def run_trajectory_inference(model, traj, action_metadata, device,
+def run_trajectory_inference(model, traj, device,
                              use_proprio=False, add_eef=False,
                              normalize_proprio=False, chunk_size=64,
                              target_state_dict=None):
@@ -66,10 +66,8 @@ def run_trajectory_inference(model, traj, action_metadata, device,
 
     pred_norm = np.concatenate(all_pred, axis=0)  # (T, action_dim)
 
-    # Denormalize
-    action_mean = np.array(action_metadata["action"]["mean"])
-    action_std = np.array(action_metadata["action"]["std"])
-    pred_raw = pred_norm * action_std + action_mean
+    # Denormalize using JOINT_RANGE bounds
+    pred_raw = denormalize_actions_bounds_np(pred_norm)
 
     return pred_raw
 
@@ -117,7 +115,7 @@ def save_gif(frames, path, fps=10):
         duration=int(1000 / fps), loop=0)
 
 
-def visualize_predictions(model, vis_trajs, step, save_dir, action_metadata,
+def visualize_predictions(model, vis_trajs, step, save_dir,
                           device, use_wandb=False, use_proprio=False,
                           add_eef=False, normalize_proprio=False,
                           target_state_dict=None):
@@ -129,7 +127,7 @@ def visualize_predictions(model, vis_trajs, step, save_dir, action_metadata,
 
     for i, traj in enumerate(vis_trajs):
         pred_actions = run_trajectory_inference(
-            model, traj, action_metadata, device,
+            model, traj, device,
             use_proprio=use_proprio, add_eef=add_eef,
             normalize_proprio=normalize_proprio,
             target_state_dict=target_state_dict)
