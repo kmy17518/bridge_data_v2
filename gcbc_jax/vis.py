@@ -47,15 +47,21 @@ def load_vis_trajectories(val_tfrecord_paths, n=3, seed=42):
                 "actions", "goal_image",
             ]}
             parsed = tf.io.parse_single_example(raw_record, features)
+            obs_jpegs = tf.io.parse_tensor(
+                parsed["observations/images0"], tf.string)
+            obs_images = tf.map_fn(
+                lambda j: tf.io.decode_jpeg(j, channels=3),
+                obs_jpegs, fn_output_signature=tf.uint8).numpy()
+            goal_jpeg = tf.io.parse_tensor(
+                parsed["goal_image"], tf.string)
+            goal_image = tf.io.decode_jpeg(goal_jpeg, channels=3).numpy()
             trajectories.append({
-                "obs_images": tf.io.parse_tensor(
-                    parsed["observations/images0"], tf.uint8).numpy(),
+                "obs_images": obs_images,
                 "obs_state": tf.io.parse_tensor(
                     parsed["observations/state"], tf.float32).numpy(),
                 "actions": tf.io.parse_tensor(
                     parsed["actions"], tf.float32).numpy(),
-                "goal_image": tf.io.parse_tensor(
-                    parsed["goal_image"], tf.uint8).numpy(),
+                "goal_image": goal_image,
                 "name": os.path.splitext(os.path.basename(path))[0],
             })
             break  # one trajectory per TFRecord

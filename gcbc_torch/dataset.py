@@ -16,27 +16,43 @@ import torchvision.transforms.v2.functional as TF
 from .proprio import extract_proprio_tf, normalize_proprio_bounds_tf, normalize_actions_bounds_tf
 
 
-# TFRecord field types (same as jaxrl_m BridgeDataset + goal_image)
+# TFRecord field types (same as jaxrl_m BridgeDataset + goal_image).
+# Image fields store JPEG-compressed string tensors; non-image fields are raw.
 PROTO_TYPE_SPEC = {
-    "observations/images0": tf.uint8,
+    "observations/images0": tf.string,
     "observations/state": tf.float32,
-    "next_observations/images0": tf.uint8,
+    "next_observations/images0": tf.string,
     "next_observations/state": tf.float32,
     "actions": tf.float32,
     "terminals": tf.bool,
     "truncates": tf.bool,
-    "goal_image": tf.uint8,
+    "goal_image": tf.string,
 }
+
+IMAGE_KEYS = {"observations/images0", "next_observations/images0", "goal_image"}
+
+
+def _decode_jpeg_frames(jpeg_tensor):
+    """Decode a 1-D string tensor of JPEG bytes into (T, H, W, 3) uint8."""
+    return tf.map_fn(
+        lambda j: tf.io.decode_jpeg(j, channels=3),
+        jpeg_tensor,
+        fn_output_signature=tf.uint8,
+    )
 
 
 def _decode_example(example_proto, use_proprio=False, add_eef_proprio=False):
-    """Decode a single TFRecord example."""
+    """Decode a single TFRecord example (JPEG-compressed image fields)."""
     features = {key: tf.io.FixedLenFeature([], tf.string) for key in PROTO_TYPE_SPEC}
     parsed = tf.io.parse_single_example(example_proto, features)
     tensors = {
         key: tf.io.parse_tensor(parsed[key], dtype)
         for key, dtype in PROTO_TYPE_SPEC.items()
     }
+
+    obs_images = _decode_jpeg_frames(tensors["observations/images0"])
+    next_obs_images = _decode_jpeg_frames(tensors["next_observations/images0"])
+    goal_image = tf.io.decode_jpeg(tensors["goal_image"], channels=3)
 
     obs_proprio = tensors["observations/state"]
     next_obs_proprio = tensors["next_observations/state"]
@@ -49,17 +65,17 @@ def _decode_example(example_proto, use_proprio=False, add_eef_proprio=False):
 
     return {
         "observations": {
-            "image": tensors["observations/images0"],
+            "image": obs_images,
             "proprio": obs_proprio,
         },
         "next_observations": {
-            "image": tensors["next_observations/images0"],
+            "image": next_obs_images,
             "proprio": next_obs_proprio,
         },
         "actions": tensors["actions"],
         "terminals": tensors["terminals"],
         "truncates": tensors["truncates"],
-        "goal_image": tensors["goal_image"],
+        "goal_image": goal_image,
     }
 
 
@@ -222,15 +238,19 @@ def load_raw_trajectories(tfrecord_paths, n=3, seed=42):
                 "actions", "goal_image",
             ]}
             parsed = tf.io.parse_single_example(raw_record, features)
+            obs_jpegs = tf.io.parse_tensor(
+                parsed["observations/images0"], tf.string)
+            obs_images = _decode_jpeg_frames(obs_jpegs).numpy()
+            goal_jpeg = tf.io.parse_tensor(
+                parsed["goal_image"], tf.string)
+            goal_image = tf.io.decode_jpeg(goal_jpeg, channels=3).numpy()
             trajectories.append({
-                "obs_images": tf.io.parse_tensor(
-                    parsed["observations/images0"], tf.uint8).numpy(),
+                "obs_images": obs_images,
                 "obs_state": tf.io.parse_tensor(
                     parsed["observations/state"], tf.float32).numpy(),
                 "actions": tf.io.parse_tensor(
                     parsed["actions"], tf.float32).numpy(),
-                "goal_image": tf.io.parse_tensor(
-                    parsed["goal_image"], tf.uint8).numpy(),
+                "goal_image": goal_image,
                 "name": os.path.splitext(os.path.basename(path))[0],
             })
             break  # one trajectory per TFRecord
