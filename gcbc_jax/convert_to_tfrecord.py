@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from PIL import Image
+from tqdm import tqdm
 
 
 def decode_video_frames(video_path: str) -> np.ndarray:
@@ -62,19 +63,27 @@ def serialize_jpeg_single(image, quality=95):
 
 
 def make_example(obs_images, next_obs_images, obs_state, next_obs_state,
-                 actions, terminals, truncates, goal_image):
+                 actions, terminals, truncates, goal_image, jpeg=True):
     """Create a tf.train.Example for one trajectory.
 
-    Image fields are stored as JPEG-compressed string tensors for ~10-15x
-    smaller files vs raw uint8. Non-image fields are unchanged.
+    When jpeg=True (default), image fields are stored as JPEG-compressed
+    string tensors for ~10-15x smaller files. When jpeg=False, images are
+    stored as raw uint8 tensors (lossless).
     """
+    if jpeg:
+        ser_frames = serialize_jpeg_frames
+        ser_single = serialize_jpeg_single
+    else:
+        ser_frames = serialize_tensor
+        ser_single = serialize_tensor
+
     feature = {
         "observations/images0": tf.train.Feature(
-            bytes_list=tf.train.BytesList(value=[serialize_jpeg_frames(obs_images)])),
+            bytes_list=tf.train.BytesList(value=[ser_frames(obs_images)])),
         "observations/state": tf.train.Feature(
             bytes_list=tf.train.BytesList(value=[serialize_tensor(obs_state)])),
         "next_observations/images0": tf.train.Feature(
-            bytes_list=tf.train.BytesList(value=[serialize_jpeg_frames(next_obs_images)])),
+            bytes_list=tf.train.BytesList(value=[ser_frames(next_obs_images)])),
         "next_observations/state": tf.train.Feature(
             bytes_list=tf.train.BytesList(value=[serialize_tensor(next_obs_state)])),
         "actions": tf.train.Feature(
@@ -84,7 +93,7 @@ def make_example(obs_images, next_obs_images, obs_state, next_obs_state,
         "truncates": tf.train.Feature(
             bytes_list=tf.train.BytesList(value=[serialize_tensor(truncates)])),
         "goal_image": tf.train.Feature(
-            bytes_list=tf.train.BytesList(value=[serialize_jpeg_single(goal_image)])),
+            bytes_list=tf.train.BytesList(value=[ser_single(goal_image)])),
     }
     return tf.train.Example(features=tf.train.Features(feature=feature))
 
@@ -142,9 +151,21 @@ def convert_episode(parquet_path, video_dir, project_root, action_dim=23, image_
             actions, terminals, truncates, goal_img, episode_name)
 
 
+def parse_int_list(s: str) -> list[int]:
+    """Parse '1-20' (inclusive range) or '1,2,4,5' (comma-separated) into a list of ints."""
+    if "-" in s and "," not in s:
+        lo, hi = s.split("-", 1)
+        return list(range(int(lo), int(hi) + 1))
+    return [int(x) for x in s.split(",")]
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument("--data_dir", type=str, default=None)
+    parser.add_argument("--seeds", type=str, default=None,
+                        help="Seed range (e.g. 1-20) or list (e.g. 1,2,4,5)")
+    parser.add_argument("--task_id", type=str, default=None,
+                        help="Task ID range (e.g. 51-53) or list (e.g. 51,52)")
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--project_root", type=str, default=None)
     parser.add_argument("--video_dir", type=str, default=None,
@@ -155,26 +176,51 @@ def main():
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--test_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no_loss", action="store_true",
+                        help="Use lossless raw encoding for images instead of JPEG")
     args = parser.parse_args()
+
+    # Validate mutually exclusive data source options
+    if args.seeds is not None or args.task_id is not None:
+        assert args.seeds and args.task_id, \
+            "--seeds and --task_id must both be provided"
+        assert args.data_dir is None, \
+            "--data_dir cannot be used with --seeds/--task_id"
+        seeds = parse_int_list(args.seeds)
+        task_ids = parse_int_list(args.task_id)
+    else:
+        assert args.data_dir is not None, \
+            "Either --data_dir or --seeds + --task_id is required"
 
     assert abs(args.train_ratio + args.val_ratio + args.test_ratio - 1.0) < 1e-6, \
         f"Ratios must sum to 1.0, got {args.train_ratio + args.val_ratio + args.test_ratio}"
 
-    # Auto-detect video_dir
-    if args.video_dir is None:
-        task_name = os.path.basename(args.data_dir)
-        demos_root = os.path.dirname(os.path.dirname(args.data_dir))
-        args.video_dir = os.path.join(demos_root, "videos", task_name)
+    # Build list of (parquet_path, video_dir) tuples
+    episodes = []
+    if args.data_dir:
+        if args.video_dir is None:
+            task_name = os.path.basename(args.data_dir)
+            demos_root = os.path.dirname(os.path.dirname(args.data_dir))
+            args.video_dir = os.path.join(demos_root, "videos", task_name)
+        for pq in sorted(glob.glob(os.path.join(args.data_dir, "*.parquet"))):
+            episodes.append((pq, args.video_dir))
+    else:
+        for seed in seeds:
+            for tid in task_ids:
+                data_dir = f"datasets/ispatialgym-demos-seed{seed}/data/task-{tid:04d}"
+                video_dir = args.video_dir or os.path.join(
+                    f"datasets/ispatialgym-demos-seed{seed}", "videos", f"task-{tid:04d}")
+                for pq in sorted(glob.glob(os.path.join(data_dir, "*.parquet"))):
+                    episodes.append((pq, video_dir))
 
-    parquets = sorted(glob.glob(os.path.join(args.data_dir, "*.parquet")))
-    print(f"Found {len(parquets)} episodes")
+    print(f"Found {len(episodes)} episodes")
 
     # Train/val/test split by episode (8:1:1)
     rng = np.random.RandomState(args.seed)
-    indices = np.arange(len(parquets))
+    indices = np.arange(len(episodes))
     rng.shuffle(indices)
-    n_test = max(1, int(len(parquets) * args.test_ratio))
-    n_val = max(1, int(len(parquets) * args.val_ratio))
+    n_test = max(1, int(len(episodes) * args.test_ratio)) if args.test_ratio > 0 else 0
+    n_val = max(1, int(len(episodes) * args.val_ratio)) if args.val_ratio > 0 else 0
     test_indices = set(indices[:n_test].tolist())
     val_indices = set(indices[n_test:n_test + n_val].tolist())
 
@@ -185,7 +231,7 @@ def main():
     all_actions = []
     all_proprios = []
 
-    for i, pq_path in enumerate(parquets):
+    for i, (pq_path, video_dir) in enumerate(tqdm(episodes, desc="Converting")):
         if i in test_indices:
             split = "test"
         elif i in val_indices:
@@ -195,7 +241,7 @@ def main():
 
         (obs_images, next_obs_images, obs_state, next_obs_state,
          actions, terminals, truncates, goal_img, ep_name) = convert_episode(
-            pq_path, args.video_dir, args.project_root, image_size=args.image_size)
+            pq_path, video_dir, args.project_root, image_size=args.image_size)
 
         if split == "train":
             all_actions.append(actions)
@@ -206,7 +252,8 @@ def main():
         with tf.io.TFRecordWriter(out_path) as writer:
             example = make_example(
                 obs_images, next_obs_images, obs_state, next_obs_state,
-                actions, terminals, truncates, goal_img)
+                actions, terminals, truncates, goal_img,
+                jpeg=(not args.no_loss))
             writer.write(example.SerializeToString())
 
         print(f"  [{split}] {ep_name}: {len(actions)} transitions, goal {goal_img.shape}")
@@ -223,6 +270,7 @@ def main():
     stats = {
         "action": {"mean": action_mean.tolist(), "std": action_std.tolist()},
         "proprio": {"mean": proprio_mean.tolist(), "std": proprio_std.tolist()},
+        "image_encoding": "raw" if args.no_loss else "jpeg",
     }
 
     import json
@@ -234,7 +282,7 @@ def main():
     print(f"Action std:  {action_std[:5]}...")
     print(f"Proprio dim: {proprio_mean.shape[0]}, mean[:5]: {proprio_mean[:5]}...")
     print(f"Proprio std[:5]: {proprio_std[:5]}...")
-    n_train = len(parquets) - n_val - n_test
+    n_train = len(episodes) - n_val - n_test
     print(f"\nDone. Train: {n_train}, Val: {n_val}, Test: {n_test} episodes")
 
 
