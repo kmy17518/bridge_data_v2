@@ -31,11 +31,13 @@ ACTION_LABELS = [
 ]
 
 
-def load_vis_trajectories(val_tfrecord_paths, n=3, seed=42):
+def load_vis_trajectories(val_tfrecord_paths, n=3, seed=42, image_encoding="jpeg"):
     """Load n raw trajectories from validation TFRecords for visualization."""
     rng = np.random.RandomState(seed)
     n = min(n, len(val_tfrecord_paths))
     selected = rng.choice(len(val_tfrecord_paths), size=n, replace=False)
+
+    img_dtype = tf.string if image_encoding == "jpeg" else tf.uint8
 
     trajectories = []
     for idx in sorted(selected):
@@ -47,14 +49,18 @@ def load_vis_trajectories(val_tfrecord_paths, n=3, seed=42):
                 "actions", "goal_image",
             ]}
             parsed = tf.io.parse_single_example(raw_record, features)
-            obs_jpegs = tf.io.parse_tensor(
-                parsed["observations/images0"], tf.string)
-            obs_images = tf.map_fn(
-                lambda j: tf.io.decode_jpeg(j, channels=3),
-                obs_jpegs, fn_output_signature=tf.uint8).numpy()
-            goal_jpeg = tf.io.parse_tensor(
-                parsed["goal_image"], tf.string)
-            goal_image = tf.io.decode_jpeg(goal_jpeg, channels=3).numpy()
+            obs_raw = tf.io.parse_tensor(
+                parsed["observations/images0"], img_dtype)
+            goal_raw = tf.io.parse_tensor(
+                parsed["goal_image"], img_dtype)
+            if image_encoding == "jpeg":
+                obs_images = tf.map_fn(
+                    lambda j: tf.io.decode_jpeg(j, channels=3),
+                    obs_raw, fn_output_signature=tf.uint8).numpy()
+                goal_image = tf.io.decode_jpeg(goal_raw, channels=3).numpy()
+            else:
+                obs_images = obs_raw.numpy()
+                goal_image = goal_raw.numpy()
             trajectories.append({
                 "obs_images": obs_images,
                 "obs_state": tf.io.parse_tensor(

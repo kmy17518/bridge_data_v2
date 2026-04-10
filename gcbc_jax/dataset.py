@@ -28,7 +28,7 @@ class FixedGoalBridgeDataset(BridgeDataset):
     """
 
     # Extend PROTO_TYPE_SPEC with the goal_image field.
-    # Image fields store JPEG-compressed string tensors.
+    # Default assumes JPEG-compressed string tensors; overridden for raw encoding.
     PROTO_TYPE_SPEC = {
         **{k: (tf.string if v == tf.uint8 else v)
            for k, v in BridgeDataset.PROTO_TYPE_SPEC.items()},
@@ -36,10 +36,16 @@ class FixedGoalBridgeDataset(BridgeDataset):
     }
 
     def __init__(self, *args, use_proprio=False, add_eef_proprio=False,
-                 normalize_proprio=False, **kwargs):
+                 normalize_proprio=False, image_encoding="jpeg", **kwargs):
         self.use_proprio = use_proprio
         self.add_eef_proprio = add_eef_proprio
         self.normalize_proprio = normalize_proprio
+        self.image_encoding = image_encoding
+        if image_encoding == "raw":
+            self.PROTO_TYPE_SPEC = {
+                **BridgeDataset.PROTO_TYPE_SPEC,
+                "goal_image": tf.uint8,
+            }
         super().__init__(*args, **kwargs)
 
     @staticmethod
@@ -52,7 +58,7 @@ class FixedGoalBridgeDataset(BridgeDataset):
         )
 
     def _decode_example(self, example_proto):
-        """Decode example including the fixed goal image (JPEG-compressed)."""
+        """Decode example including the fixed goal image."""
         features = {
             key: tf.io.FixedLenFeature([], tf.string)
             for key in self.PROTO_TYPE_SPEC.keys()
@@ -63,10 +69,15 @@ class FixedGoalBridgeDataset(BridgeDataset):
             for key, dtype in self.PROTO_TYPE_SPEC.items()
         }
 
-        obs_images = self._decode_jpeg_frames(parsed_tensors["observations/images0"])
-        next_obs_images = self._decode_jpeg_frames(
-            parsed_tensors["next_observations/images0"])
-        goal_image = tf.io.decode_jpeg(parsed_tensors["goal_image"], channels=3)
+        if self.image_encoding == "jpeg":
+            obs_images = self._decode_jpeg_frames(parsed_tensors["observations/images0"])
+            next_obs_images = self._decode_jpeg_frames(
+                parsed_tensors["next_observations/images0"])
+            goal_image = tf.io.decode_jpeg(parsed_tensors["goal_image"], channels=3)
+        else:
+            obs_images = parsed_tensors["observations/images0"]
+            next_obs_images = parsed_tensors["next_observations/images0"]
+            goal_image = parsed_tensors["goal_image"]
 
         obs_proprio = parsed_tensors["observations/state"]
         next_obs_proprio = parsed_tensors["next_observations/state"]

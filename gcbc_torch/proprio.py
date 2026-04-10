@@ -247,6 +247,22 @@ def normalize_actions_bounds_tf(actions):
     return tf.where(mask, normalized, actions)
 
 
+def normalize_actions_bounds_np(actions):
+    """Normalize 23-dim actions to [-1, 1] using JOINT_RANGE bounds (NumPy).
+
+    Non-gripper dims: min-max normalization.
+    Gripper dims [14, 22]: binarize to {-1, 1}.
+    """
+    result = actions.copy()
+    mask = ACTION_NON_GRIPPER_MASK_23
+    low = ACTION_BOUNDS_LOW_23
+    high = ACTION_BOUNDS_HIGH_23
+    result[..., mask] = 2.0 * (result[..., mask] - low[mask]) / (high[mask] - low[mask] + 1e-8) - 1.0
+    for gi in ACTION_GRIPPER_INDICES:
+        result[..., gi] = np.where(result[..., gi] > 0, 1.0, -1.0)
+    return result.astype(np.float32)
+
+
 def denormalize_actions_bounds_np(actions):
     """Denormalize 23-dim actions from [-1, 1] to original range (NumPy).
 

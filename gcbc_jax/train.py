@@ -55,6 +55,7 @@ def train(args):
     stats_path = os.path.join(args.tfrecord_dir, "action_proprio_metadata.json")
     with open(stats_path) as f:
         action_proprio_metadata = json.load(f)
+    image_encoding = action_proprio_metadata.pop("image_encoding", "jpeg")
     # Convert to numpy
     for key in action_proprio_metadata:
         for stat in action_proprio_metadata[key]:
@@ -98,6 +99,7 @@ def train(args):
         use_proprio=args.use_proprio,
         add_eef_proprio=args.add_eef_proprio,
         normalize_proprio=args.normalize_proprio,
+        image_encoding=image_encoding,
     )
 
     train_data = FixedGoalBridgeDataset(
@@ -121,7 +123,8 @@ def train(args):
     )
 
     # Load 3 fixed val trajectories for visualization
-    vis_trajs = load_vis_trajectories(val_paths, n=3, seed=args.seed)
+    vis_trajs = load_vis_trajectories(val_paths, n=3, seed=args.seed,
+                                      image_encoding=image_encoding)
     print(f"Loaded {len(vis_trajs)} val trajectories for visualization")
     vis_rng = jax.random.PRNGKey(args.seed + 100)
 

@@ -64,6 +64,13 @@ def train(args):
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
     os.makedirs(args.save_dir, exist_ok=True)
 
+    # Detect image encoding from metadata
+    import json
+    metadata_path = os.path.join(args.tfrecord_dir, "action_proprio_metadata.json")
+    with open(metadata_path) as f:
+        metadata = json.load(f)
+    image_encoding = metadata.get("image_encoding", "jpeg")
+
     # Find TFRecord paths
     train_paths = sorted(glob.glob(os.path.join(args.tfrecord_dir, "train", "*.tfrecord")))
     val_paths = sorted(glob.glob(os.path.join(args.tfrecord_dir, "val", "*.tfrecord")))
@@ -91,6 +98,7 @@ def train(args):
         augment=args.augment, augment_kwargs=augment_kwargs,
         use_proprio=args.use_proprio, add_eef_proprio=args.add_eef_proprio,
         normalize_proprio=args.normalize_proprio,
+        image_encoding=image_encoding,
     )
 
     val_dataset = build_tf_dataset(
@@ -98,10 +106,12 @@ def train(args):
         augment=False, augment_kwargs=None,
         use_proprio=args.use_proprio, add_eef_proprio=args.add_eef_proprio,
         normalize_proprio=args.normalize_proprio,
+        image_encoding=image_encoding,
     )
 
     # Load vis trajectories
-    vis_trajs = load_raw_trajectories(val_paths, n=3, seed=args.seed)
+    vis_trajs = load_raw_trajectories(val_paths, n=3, seed=args.seed,
+                                      image_encoding=image_encoding)
     print(f"Loaded {len(vis_trajs)} val trajectories for visualization")
 
     # Resolve training mode (epoch vs step)
@@ -125,6 +135,7 @@ def train(args):
             augment=args.augment, augment_kwargs=augment_kwargs,
             use_proprio=args.use_proprio, add_eef_proprio=args.add_eef_proprio,
             normalize_proprio=args.normalize_proprio,
+            image_encoding=image_encoding,
         )
     else:
         total_steps = args.num_steps or 100000

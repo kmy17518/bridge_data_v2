@@ -27,11 +27,13 @@ class TorchGCBCEvalPolicy:
     def __init__(self, checkpoint_dir: str, goal_image_path: str,
                  use_proprio: bool = False, add_eef_proprio: bool = False,
                  normalize_proprio: bool = False,
-                 action_metadata_path: str | None = None):
+                 action_metadata_path: str | None = None,
+                 image_size: int = 256):
         self.use_proprio = use_proprio
         self.add_eef_proprio = add_eef_proprio
         self.normalize_proprio = normalize_proprio
         self.action_metadata_path = action_metadata_path
+        self.image_size = image_size
 
         # Load z-score stats for legacy checkpoints
         if action_metadata_path is not None:
@@ -49,8 +51,10 @@ class TorchGCBCEvalPolicy:
         else:
             proprio_dim = 23
 
-        # Load goal image
-        goal_img = np.array(Image.open(goal_image_path).convert("RGB"))
+        # Load goal image — resize to match training resolution (convert_to_tfrecord.py)
+        goal_img = np.array(
+            Image.open(goal_image_path).convert("RGB").resize((image_size, image_size))
+        )
         self.goal_image = goal_img  # uint8
 
         # Find and load latest checkpoint
@@ -118,12 +122,11 @@ class TorchGCBCEvalPolicy:
         if obs_image.shape[-1] == 4:
             obs_image = obs_image[..., :3]
 
-        # Resize obs to match goal resolution if needed
-        goal_H, goal_W = self.goal_image.shape[:2]
-        obs_H, obs_W = obs_image.shape[:2]
-        if obs_H != goal_H or obs_W != goal_W:
+        # Resize obs to match training resolution (convert_to_tfrecord.py)
+        sz = self.image_size
+        if obs_image.shape[0] != sz or obs_image.shape[1] != sz:
             obs_image = np.array(
-                Image.fromarray(obs_image).resize((goal_W, goal_H))
+                Image.fromarray(obs_image).resize((sz, sz))
             )
 
         # Build tensors
@@ -164,6 +167,51 @@ class TorchGCBCEvalPolicy:
             actions_denorm = denormalize_actions_bounds_np(actions_np)
 
         return torch.tensor(actions_denorm, dtype=torch.float32)
+
+    def preprocess_obs_for_comparison(self, obs):
+        """Return preprocessed (obs_image, goal_image, proprio) without inference.
+
+        Replicates the same preprocessing as forward() but returns numpy arrays
+        instead of running the model.
+
+        Returns:
+            dict with:
+                "obs_image": (image_size, image_size, 3) uint8 numpy
+                "goal_image": (image_size, image_size, 3) uint8 numpy
+                "proprio": (23,) or (37,) float32 numpy, or None
+        """
+        head_key = "robot_r1::robot_r1:zed_link:Camera:0::rgb"
+        head_rgb = obs[head_key]
+
+        obs_image = head_rgb.cpu().numpy().astype(np.uint8)
+        if obs_image.shape[-1] == 4:
+            obs_image = obs_image[..., :3]
+
+        sz = self.image_size
+        if obs_image.shape[0] != sz or obs_image.shape[1] != sz:
+            obs_image = np.array(
+                Image.fromarray(obs_image).resize((sz, sz))
+            )
+
+        proprio = None
+        if self.use_proprio:
+            proprio_256 = obs["robot_r1::proprio"].cpu().numpy().astype(np.float32)
+            proprio = extract_proprio_np(proprio_256, add_eef=self.add_eef_proprio)
+            if self.normalize_proprio:
+                proprio = normalize_proprio_bounds_np(proprio, add_eef=self.add_eef_proprio)
+            if self.action_metadata_path is not None:
+                proprio = np.concatenate([
+                    proprio[..., :14],
+                    proprio[..., 15:22],
+                    proprio[..., 14:15],
+                    proprio[..., 22:23],
+                ], axis=-1)
+
+        return {
+            "obs_image": obs_image,
+            "goal_image": self.goal_image.copy(),
+            "proprio": proprio,
+        }
 
     def reset(self):
         pass
