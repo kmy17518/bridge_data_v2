@@ -178,6 +178,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no_loss", action="store_true",
                         help="Use lossless raw encoding for images instead of JPEG")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip episodes whose .tfrecord already exists")
     args = parser.parse_args()
 
     # Validate mutually exclusive data source options
@@ -231,6 +233,7 @@ def main():
     all_actions = []
     all_proprios = []
 
+    skipped = 0
     for i, (pq_path, video_dir) in enumerate(tqdm(episodes, desc="Converting")):
         if i in test_indices:
             split = "test"
@@ -238,6 +241,18 @@ def main():
             split = "val"
         else:
             split = "train"
+
+        ep_name = os.path.splitext(os.path.basename(pq_path))[0]
+        out_path = os.path.join(args.output_dir, split, f"{ep_name}.tfrecord")
+
+        if args.resume and os.path.exists(out_path):
+            # Already converted — still collect stats from parquet (cheap)
+            if split == "train":
+                df = pd.read_parquet(pq_path)
+                all_actions.append(np.stack(df["action"].values).astype(np.float32)[:-1])
+                all_proprios.append(np.stack(df["observation.state"].values).astype(np.float32)[:-1])
+            skipped += 1
+            continue
 
         (obs_images, next_obs_images, obs_state, next_obs_state,
          actions, terminals, truncates, goal_img, ep_name) = convert_episode(
@@ -248,7 +263,6 @@ def main():
             all_proprios.append(obs_state)
 
         # Write TFRecord (one trajectory per file)
-        out_path = os.path.join(args.output_dir, split, f"{ep_name}.tfrecord")
         with tf.io.TFRecordWriter(out_path) as writer:
             example = make_example(
                 obs_images, next_obs_images, obs_state, next_obs_state,
@@ -283,7 +297,9 @@ def main():
     print(f"Proprio dim: {proprio_mean.shape[0]}, mean[:5]: {proprio_mean[:5]}...")
     print(f"Proprio std[:5]: {proprio_std[:5]}...")
     n_train = len(episodes) - n_val - n_test
-    print(f"\nDone. Train: {n_train}, Val: {n_val}, Test: {n_test} episodes")
+    if skipped:
+        print(f"\nResumed: skipped {skipped} existing episodes")
+    print(f"Done. Train: {n_train}, Val: {n_val}, Test: {n_test} episodes")
 
 
 if __name__ == "__main__":
