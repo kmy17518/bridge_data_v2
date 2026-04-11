@@ -20,6 +20,7 @@ Usage:
 import argparse
 import copy
 import glob
+import json
 import math
 import os
 
@@ -64,8 +65,41 @@ def train(args):
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
     os.makedirs(args.save_dir, exist_ok=True)
 
+    # Save train config for eval_ispatialgym_batched.py and reproducibility
+    _policy_type_map = {"gcbc": "gcbc_torch", "gc_ddpm_bc": "gcbc_torch", "gc_iql": "gcbc_torch"}
+    train_config = {
+        # Fields required by eval_ispatialgym_batched.py (uses "propio" spelling)
+        "policy": _policy_type_map.get(args.policy, "gcbc_torch"),
+        "use_propio": args.use_proprio,
+        "add_eef_propio": args.add_eef_proprio,
+        "normalize_propio": args.normalize_proprio,
+        # Training hyperparams for reproducibility
+        "policy_arch": args.policy,
+        "encoder": args.encoder,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "warmup_steps": args.warmup_steps,
+        "num_steps": args.num_steps,
+        "num_epochs": args.num_epochs,
+        "seed": args.seed,
+        "augment": args.augment,
+        "run_name": args.run_name,
+        "tfrecord_dir": args.tfrecord_dir,
+        "save_dir": args.save_dir,
+        # Policy-specific hyperparams
+        "diffusion_steps": args.diffusion_steps,
+        "target_update_rate": args.target_update_rate,
+        "discount": args.discount,
+        "expectile": args.expectile,
+        "temperature": args.temperature,
+        "negative_proportion": args.negative_proportion,
+    }
+    config_path = os.path.join(args.save_dir, "train_config.json")
+    with open(config_path, "w") as f:
+        json.dump(train_config, f, indent=4)
+    print(f"Saved train config to {config_path}")
+
     # Detect image encoding from metadata
-    import json
     metadata_path = os.path.join(args.tfrecord_dir, "action_proprio_metadata.json")
     with open(metadata_path) as f:
         metadata = json.load(f)
