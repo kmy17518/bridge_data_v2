@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import glob
+import json
 import os
 
 import av
@@ -172,6 +173,37 @@ def parse_int_list(s: str) -> list[int]:
     return [int(x) for x in s.split(",")]
 
 
+def resolve_instance_metadata(parquet_path, project_root):
+    """Derive instance directory paths from a parquet's image_condition_path.
+
+    Returns dict with keys: bddl_path, template_path, tro_path, goal_image_path.
+    All paths are absolute.
+    """
+    df = pd.read_parquet(parquet_path, columns=["image_condition_path"])
+    goal_img_path = df["image_condition_path"].iloc[0]
+    if not os.path.isabs(goal_img_path) and project_root:
+        goal_img_path = os.path.join(project_root, goal_img_path)
+    goal_img_path = os.path.abspath(goal_img_path)
+
+    instance_dir = os.path.dirname(goal_img_path)
+
+    bddl_files = glob.glob(os.path.join(instance_dir, "bddl", "*.bddl"))
+    assert len(bddl_files) == 1, f"Expected 1 BDDL file in {instance_dir}/bddl, got {len(bddl_files)}"
+
+    template_files = glob.glob(os.path.join(instance_dir, "*_template.json"))
+    assert len(template_files) == 1, f"Expected 1 template file in {instance_dir}, got {len(template_files)}"
+
+    tro_files = glob.glob(os.path.join(instance_dir, "*-tro_state.json"))
+    assert len(tro_files) == 1, f"Expected 1 tro_state file in {instance_dir}, got {len(tro_files)}"
+
+    return {
+        "bddl_path": os.path.abspath(bddl_files[0]),
+        "template_path": os.path.abspath(template_files[0]),
+        "tro_path": os.path.abspath(tro_files[0]),
+        "goal_image_path": goal_img_path,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default=None)
@@ -245,6 +277,7 @@ def main():
 
     all_actions = []
     all_proprios = []
+    test_episode_metadata = {}
 
     skipped = 0
     for i, (pq_path, video_dir) in enumerate(tqdm(episodes, desc="Converting")):
@@ -264,6 +297,10 @@ def main():
                 df = pd.read_parquet(pq_path)
                 all_actions.append(np.stack(df["action"].values).astype(np.float32)[:-1])
                 all_proprios.append(np.stack(df["observation.state"].values).astype(np.float32)[:-1])
+            elif split == "test":
+                meta = resolve_instance_metadata(pq_path, args.project_root)
+                meta["tfrecord_path"] = os.path.abspath(out_path)
+                test_episode_metadata[ep_name] = meta
             skipped += 1
             continue
 
@@ -283,6 +320,11 @@ def main():
                 jpeg=(not args.no_loss))
             writer.write(example.SerializeToString())
 
+        if split == "test":
+            meta = resolve_instance_metadata(pq_path, args.project_root)
+            meta["tfrecord_path"] = os.path.abspath(out_path)
+            test_episode_metadata[ep_name] = meta
+
         print(f"  [{split}] {ep_name}: {len(actions)} transitions, goal {goal_img.shape}")
 
     # Compute and save action + proprio normalization stats
@@ -300,11 +342,16 @@ def main():
         "image_encoding": "raw" if args.no_loss else "jpeg",
     }
 
-    import json
     stats_path = os.path.join(args.output_dir, "action_proprio_metadata.json")
     with open(stats_path, "w") as f:
         json.dump(stats, f, indent=2)
     print(f"\nStats saved to {stats_path}")
+
+    if test_episode_metadata:
+        test_episodes_path = os.path.join(args.output_dir, "test_episodes.json")
+        with open(test_episodes_path, "w") as f:
+            json.dump(test_episode_metadata, f, indent=2)
+        print(f"Test episodes JSON saved to {test_episodes_path} ({len(test_episode_metadata)} episodes)")
     print(f"Action mean: {action_mean[:5]}...")
     print(f"Action std:  {action_std[:5]}...")
     print(f"Proprio dim: {proprio_mean.shape[0]}, mean[:5]: {proprio_mean[:5]}...")
