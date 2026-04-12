@@ -206,7 +206,7 @@ def build_tf_dataset(tfrecord_paths, batch_size, seed, train=True,
     # Batch
     dataset = dataset.batch(batch_size, drop_remainder=True,
                             num_parallel_calls=tf.data.AUTOTUNE)
-    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    dataset = dataset.prefetch(1)
 
     return dataset
 
