@@ -68,11 +68,10 @@ def train(args):
     # Save train config for eval_ispatialgym_batched.py and reproducibility
     _policy_type_map = {"gcbc": "gcbc_torch", "gc_ddpm_bc": "gcbc_torch", "gc_iql": "gcbc_torch"}
     train_config = {
-        # Fields required by eval_ispatialgym_batched.py (uses "propio" spelling)
         "policy": _policy_type_map.get(args.policy, "gcbc_torch"),
-        "use_propio": args.use_proprio,
-        "add_eef_propio": args.add_eef_proprio,
-        "normalize_propio": args.normalize_proprio,
+        "use_proprio": args.use_proprio,
+        "add_eef_proprio": args.add_eef_proprio,
+        "normalize_proprio": args.normalize_proprio,
         # Training hyperparams for reproducibility
         "policy_arch": args.policy,
         "encoder": args.encoder,
