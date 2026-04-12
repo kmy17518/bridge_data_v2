@@ -225,6 +225,8 @@ def main():
                         help="Use lossless raw encoding for images instead of JPEG")
     parser.add_argument("--resume", action="store_true",
                         help="Skip episodes whose .tfrecord already exists")
+    parser.add_argument("--split_json", type=str, default=None,
+                        help='Path to JSON with {"train": [...], "val": [...], "test": [...]} episode IDs')
     args = parser.parse_args()
 
     # Validate mutually exclusive data source options
@@ -239,8 +241,9 @@ def main():
         assert args.data_dir is not None, \
             "Either --data_dir or --seeds + --task_id is required"
 
-    assert abs(args.train_ratio + args.val_ratio + args.test_ratio - 1.0) < 1e-6, \
-        f"Ratios must sum to 1.0, got {args.train_ratio + args.val_ratio + args.test_ratio}"
+    if not args.split_json:
+        assert abs(args.train_ratio + args.val_ratio + args.test_ratio - 1.0) < 1e-6, \
+            f"Ratios must sum to 1.0, got {args.train_ratio + args.val_ratio + args.test_ratio}"
 
     # Build list of (parquet_path, video_dir) tuples
     episodes = []
@@ -262,14 +265,41 @@ def main():
 
     print(f"Found {len(episodes)} episodes")
 
-    # Train/val/test split by episode (8:1:1)
-    rng = np.random.RandomState(args.seed)
-    indices = np.arange(len(episodes))
-    rng.shuffle(indices)
-    n_test = max(1, int(len(episodes) * args.test_ratio)) if args.test_ratio > 0 else 0
-    n_val = max(1, int(len(episodes) * args.val_ratio)) if args.val_ratio > 0 else 0
-    test_indices = set(indices[:n_test].tolist())
-    val_indices = set(indices[n_test:n_test + n_val].tolist())
+    # Build episode_name -> split mapping
+    episode_names = [os.path.splitext(os.path.basename(pq))[0] for pq, _ in episodes]
+
+    if args.split_json:
+        with open(args.split_json) as f:
+            split_spec = json.load(f)
+        episode_to_split = {}
+        for split_name, ep_list in split_spec.items():
+            for ep_id in ep_list:
+                episode_to_split[ep_id] = split_name
+        # All found episodes must be covered by the split JSON
+        all_split_episodes = set(episode_to_split.keys())
+        found_set = set(episode_names)
+        missing = found_set - all_split_episodes
+        assert not missing, (
+            f"{len(missing)} episodes not found in split JSON: "
+            f"{sorted(missing)[:10]}{'...' if len(missing) > 10 else ''}"
+        )
+    else:
+        # Random train/val/test split
+        rng = np.random.RandomState(args.seed)
+        indices = np.arange(len(episodes))
+        rng.shuffle(indices)
+        n_test = max(1, int(len(episodes) * args.test_ratio)) if args.test_ratio > 0 else 0
+        n_val = max(1, int(len(episodes) * args.val_ratio)) if args.val_ratio > 0 else 0
+        test_indices = set(indices[:n_test].tolist())
+        val_indices = set(indices[n_test:n_test + n_val].tolist())
+        episode_to_split = {}
+        for i, name in enumerate(episode_names):
+            if i in test_indices:
+                episode_to_split[name] = "test"
+            elif i in val_indices:
+                episode_to_split[name] = "val"
+            else:
+                episode_to_split[name] = "train"
 
     for split in ["train", "val", "test"]:
         split_dir = os.path.join(args.output_dir, split)
@@ -281,14 +311,8 @@ def main():
 
     skipped = 0
     for i, (pq_path, video_dir) in enumerate(tqdm(episodes, desc="Converting")):
-        if i in test_indices:
-            split = "test"
-        elif i in val_indices:
-            split = "val"
-        else:
-            split = "train"
-
         ep_name = os.path.splitext(os.path.basename(pq_path))[0]
+        split = episode_to_split[ep_name]
         out_path = os.path.join(args.output_dir, split, f"{ep_name}.tfrecord")
 
         if args.resume and os.path.exists(out_path):
@@ -347,6 +371,15 @@ def main():
         json.dump(stats, f, indent=2)
     print(f"\nStats saved to {stats_path}")
 
+    # Save the split assignment so it can be reused via --split_json
+    split_by_name = {"train": [], "val": [], "test": []}
+    for name, s in sorted(episode_to_split.items()):
+        split_by_name.setdefault(s, []).append(name)
+    split_json_path = os.path.join(args.output_dir, "episode_ids_split.json")
+    with open(split_json_path, "w") as f:
+        json.dump(split_by_name, f, indent=2)
+    print(f"Split saved to {split_json_path}")
+
     if test_episode_metadata:
         test_episodes_path = os.path.join(args.output_dir, "test_episodes.json")
         with open(test_episodes_path, "w") as f:
@@ -356,7 +389,9 @@ def main():
     print(f"Action std:  {action_std[:5]}...")
     print(f"Proprio dim: {proprio_mean.shape[0]}, mean[:5]: {proprio_mean[:5]}...")
     print(f"Proprio std[:5]: {proprio_std[:5]}...")
-    n_train = len(episodes) - n_val - n_test
+    n_train = sum(1 for s in episode_to_split.values() if s == "train")
+    n_val = sum(1 for s in episode_to_split.values() if s == "val")
+    n_test = sum(1 for s in episode_to_split.values() if s == "test")
     if skipped:
         print(f"\nResumed: skipped {skipped} existing episodes")
     print(f"Done. Train: {n_train}, Val: {n_val}, Test: {n_test} episodes")
