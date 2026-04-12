@@ -132,20 +132,20 @@ def convert_episode(parquet_path, video_dir, project_root, action_dim=23, image_
     actions_raw = np.stack(df["action"].values).astype(np.float32)
     actions = actions_raw[:-1]     # (T-1, action_dim)
 
-    # TMP
-    # Force gripper actions to open (+1).
-    # Gripper dims: 14 (left), 22 (right) in the 23-dim action vector.
-    actions[:, 14] = 1.0
-    actions[:, 22] = 1.0
+    # # TMP
+    # # Force gripper actions to open (+1).
+    # # Gripper dims: 14 (left), 22 (right) in the 23-dim action vector.
+    # actions[:, 14] = 1.0
+    # actions[:, 22] = 1.0
 
     # Proprioception from parquet (256-dim robot state)
     proprio_raw = np.stack(df["observation.state"].values).astype(np.float32)  # (T, 256)
 
-    # TMP
-    # Force gripper finger joint positions to fully open (0.05).
-    # Left gripper fingers: state[193:195], right: state[232:234]. Range [0, 0.05].
-    proprio_raw[:, 193:195] = 0.05
-    proprio_raw[:, 232:234] = 0.05
+    # # TMP
+    # # Force gripper finger joint positions to fully open (0.05).
+    # # Left gripper fingers: state[193:195], right: state[232:234]. Range [0, 0.05].
+    # proprio_raw[:, 193:195] = 0.05
+    # proprio_raw[:, 232:234] = 0.05
 
     obs_state = proprio_raw[:-1]       # (T-1, 256)
     next_obs_state = proprio_raw[1:]   # (T-1, 256)
