@@ -75,6 +75,8 @@ def train(args):
         # Training hyperparams for reproducibility
         "policy_arch": args.policy,
         "encoder": args.encoder,
+        "encoder_model_name_or_path": args.encoder_model_name_or_path,
+        "train_encoder": args.train_encoder,
         "batch_size": args.batch_size,
         "lr": args.lr,
         "warmup_steps": args.warmup_steps,
@@ -193,6 +195,20 @@ def train(args):
     else:
         proprio_dim = 23
 
+    # Discover checkpoint before model construction (fail fast on bad --resume)
+    ckpt = None
+    if args.resume:
+        ckpt_files = sorted(glob.glob(os.path.join(args.save_dir, "checkpoint_*.pt")))
+        if not ckpt_files:
+            raise FileNotFoundError(
+                f"--resume requested but no checkpoints found in {args.save_dir}")
+        ckpt_path = max(ckpt_files,
+                        key=lambda p: int(os.path.basename(p).split("_")[1].split(".")[0]))
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+    # Extract encoder config from checkpoint for architecture reconstruction
+    encoder_config_dict = ckpt.get("encoder_config") if ckpt is not None else None
+
     # Create model
     if args.policy == "gc_iql":
         model = GCIQLPolicy(
@@ -226,10 +242,22 @@ def train(args):
             proprio_dim=proprio_dim if args.use_proprio else 23,
             hidden_dims=(256, 256, 256),
             dropout_rate=0.1,
+            encoder=args.encoder,
+            encoder_model_name_or_path=args.encoder_model_name_or_path,
+            train_encoder=args.train_encoder,
+            load_pretrained_weights=not args.resume,
+            encoder_config_dict=encoder_config_dict,
         ).to(device)
 
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {n_params:,} (policy={args.policy})")
+    n_total = sum(p.numel() for p in model.parameters())
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Policy: {args.policy}, Encoder: {args.encoder}")
+    if args.encoder != "resnetv1-34-bridge":
+        encoder_id = args.encoder_model_name_or_path or "(default HF)"
+        print(f"  Encoder model: {encoder_id}")
+        print(f"  Encoder frozen: {not args.train_encoder}")
+    print(f"  Total parameters: {n_total:,}")
+    print(f"  Trainable parameters: {n_trainable:,}")
 
     # EMA target network
     target_state_dict = None
@@ -243,26 +271,27 @@ def train(args):
             p.requires_grad_(False)
 
     # Optimizer: Adam with warmup + cosine decay (matching JAX)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
     scheduler = get_lr_schedule(optimizer, args.warmup_steps, total_steps, args.lr)
 
     # Resume from checkpoint
     start_step = 0
-    if args.resume:
-        ckpt_files = sorted(glob.glob(os.path.join(args.save_dir, "checkpoint_*.pt")))
-        if ckpt_files:
-            ckpt_path = max(ckpt_files,
-                            key=lambda p: int(os.path.basename(p).split("_")[1].split(".")[0]))
-            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-            model.load_state_dict(ckpt["model_state_dict"])
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-            if target_state_dict is not None and "target_state_dict" in ckpt:
-                target_state_dict = ckpt["target_state_dict"]
-            if target_model is not None and "target_state_dict" in ckpt:
-                target_model.load_state_dict(ckpt["target_state_dict"])
-            start_step = ckpt["step"]
-            print(f"Resumed from {ckpt_path} at step {start_step}")
+    if ckpt is not None:
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        if target_state_dict is not None and "target_state_dict" in ckpt:
+            target_state_dict = ckpt["target_state_dict"]
+        if target_model is not None and "target_state_dict" in ckpt:
+            target_model.load_state_dict(ckpt["target_state_dict"])
+        start_step = ckpt["step"]
+        print(f"Resumed from {ckpt_path} at step {start_step}")
+
+    # Extract encoder config for saving in checkpoints (enables fully offline resume)
+    _encoder_config = None
+    if hasattr(model, "pretrained_encoder"):
+        _encoder_config = model.pretrained_encoder.backbone.config.to_dict()
 
     # Optional WandB
     if args.use_wandb:
@@ -393,6 +422,8 @@ def train(args):
                 "scheduler_state_dict": scheduler.state_dict(),
                 "args": vars(args),
             }
+            if _encoder_config is not None:
+                ckpt_data["encoder_config"] = _encoder_config
             if target_state_dict is not None:
                 ckpt_data["target_state_dict"] = target_state_dict
             if target_model is not None:
@@ -409,6 +440,8 @@ def train(args):
         "scheduler_state_dict": scheduler.state_dict(),
         "args": vars(args),
     }
+    if _encoder_config is not None:
+        ckpt_data["encoder_config"] = _encoder_config
     if target_state_dict is not None:
         ckpt_data["target_state_dict"] = target_state_dict
     if target_model is not None:
@@ -430,7 +463,13 @@ def main():
                         help="Directory with train/val TFRecords")
     parser.add_argument("--save_dir", type=str, default="outputs/gcbc_torch")
     parser.add_argument("--run_name", type=str, default="gcbc_torch")
-    parser.add_argument("--encoder", type=str, default="resnetv1-34-bridge")
+    parser.add_argument("--encoder", type=str, default="resnetv1-34-bridge",
+                        choices=["resnetv1-34-bridge", "dinov2-base", "siglip-base"],
+                        help="Vision encoder: resnetv1-34-bridge, dinov2-base, siglip-base")
+    parser.add_argument("--encoder_model_name_or_path", type=str, default=None,
+                        help="HF repo id or local dir for pretrained encoder weights")
+    parser.add_argument("--train_encoder", action="store_true",
+                        help="Unfreeze pretrained encoder (dinov2/siglip only)")
 
     parser.add_argument("--num_steps", type=int, default=None,
                         help="Total training steps (step mode, default)")
@@ -478,6 +517,11 @@ def main():
                         help="Resume from latest checkpoint in save_dir")
 
     args = parser.parse_args()
+    if args.encoder != "resnetv1-34-bridge" and args.policy != "gcbc":
+        raise ValueError(
+            f"Pretrained encoder '{args.encoder}' is only supported with "
+            f"--policy gcbc. Got --policy {args.policy}."
+        )
     train(args)
 
 

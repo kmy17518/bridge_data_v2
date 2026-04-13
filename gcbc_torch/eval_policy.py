@@ -89,14 +89,20 @@ class TorchGCBCEvalPolicy:
             self.target_state_dict = ckpt.get("target_state_dict")
             print(f"Loaded PyTorch GCDDPMBCPolicy from {ckpt_path}")
         else:
+            # Detect encoder from checkpoint (default resnet for old checkpoints)
+            encoder = ckpt_args.get("encoder", "resnetv1-34-bridge")
             self.model = GCBCPolicy(
                 action_dim=action_dim,
                 use_proprio=use_proprio,
                 proprio_dim=proprio_dim,
+                encoder=encoder,
+                encoder_model_name_or_path=ckpt_args.get("encoder_model_name_or_path"),
+                train_encoder=ckpt_args.get("train_encoder", False),
+                load_pretrained_weights=False,
             ).to(self.device)
             self.model.load_state_dict(ckpt["model_state_dict"])
             self.target_state_dict = None
-            print(f"Loaded PyTorch GCBCPolicy from {ckpt_path}")
+            print(f"Loaded PyTorch GCBCPolicy from {ckpt_path} (encoder={encoder})")
 
         self.model.eval()
         if use_proprio:

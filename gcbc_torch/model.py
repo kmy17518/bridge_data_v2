@@ -155,7 +155,9 @@ class ResNetV1Encoder(nn.Module):
 class GCBCPolicy(nn.Module):
     """Goal-Conditioned Behavior Cloning policy.
 
-    Matches the JAX GCBCAgent architecture:
+    Supports two encoder modes:
+
+    A) resnetv1-34-bridge (default, matches JAX GCBCAgent):
         1. Normalize images: uint8 / 127.5 - 1.0
         2. Early goal concat: cat(obs, goal) on channel dim -> 6ch
         3. ResNet encoder -> 512-dim
@@ -163,22 +165,50 @@ class GCBCPolicy(nn.Module):
         5. MLP (256, 256, 256) with SiLU + dropout 0.1 + activate_final=True
         6. Linear -> action_dim (means)
         7. Fixed std = 1.0
+
+    B) Pretrained encoder (dinov2-base, siglip-base):
+        1. Shared encoder processes obs and goal separately
+        2. Late fusion: cat(z_obs, z_goal) -> 1536-dim
+        3. Optional proprio concat -> 1536 + proprio_dim
+        4. Same MLP and action head
     """
 
     def __init__(self, action_dim=23, use_proprio=False, proprio_dim=23,
-                 hidden_dims=(256, 256, 256), dropout_rate=0.1):
+                 hidden_dims=(256, 256, 256), dropout_rate=0.1,
+                 encoder="resnetv1-34-bridge", encoder_model_name_or_path=None,
+                 train_encoder=False, load_pretrained_weights=True,
+                 encoder_config_dict=None):
         super().__init__()
         self.action_dim = action_dim
         self.use_proprio = use_proprio
+        self.encoder_name = encoder
+        self._encoder_frozen = False
 
-        # Vision encoder: 6 input channels (obs RGB + goal RGB)
-        self.encoder = ResNetV1Encoder(
-            in_channels=6,
-            add_spatial_coordinates=True,
-        )
+        if encoder == "resnetv1-34-bridge":
+            # Existing ResNet early-fusion path.
+            # Attribute name "encoder" matches old checkpoint state_dict keys.
+            self.encoder = ResNetV1Encoder(
+                in_channels=6,
+                add_spatial_coordinates=True,
+            )
+            encoder_out_dim = self.encoder.output_dim  # 512
+        else:
+            # Pretrained late-fusion path (dinov2-base, siglip-base)
+            from .pretrained_vision import PretrainedVisionEncoder
+
+            freeze = not train_encoder
+            self.pretrained_encoder = PretrainedVisionEncoder(
+                encoder_type=encoder,
+                model_name_or_path=encoder_model_name_or_path,
+                freeze=freeze,
+                load_pretrained_weights=load_pretrained_weights,
+                encoder_config_dict=encoder_config_dict,
+            )
+            self._encoder_frozen = freeze
+            # Late fusion: obs_features + goal_features
+            encoder_out_dim = self.pretrained_encoder.output_dim * 2  # 768*2 = 1536
 
         # MLP policy head
-        encoder_out_dim = self.encoder.output_dim  # 512
         if use_proprio:
             encoder_out_dim += proprio_dim
 
@@ -208,6 +238,13 @@ class GCBCPolicy(nn.Module):
         nn.init.xavier_uniform_(self.action_head.weight)
         nn.init.zeros_(self.action_head.bias)
 
+    def train(self, mode=True):
+        """Override to keep frozen pretrained encoder in eval mode."""
+        super().train(mode)
+        if self._encoder_frozen:
+            self.pretrained_encoder.eval()
+        return self
+
     def forward(self, obs_image, goal_image, proprio=None, train=True):
         """Forward pass.
 
@@ -221,19 +258,19 @@ class GCBCPolicy(nn.Module):
             means: (B, action_dim) action means
             log_stds: (B, action_dim) log standard deviations (fixed at 0)
         """
-        # Normalize to [-1, 1] matching JAX: x / 127.5 - 1.0
-        obs = obs_image.float() / 127.5 - 1.0
-        goal = goal_image.float() / 127.5 - 1.0
-
-        # Convert NHWC -> NCHW for PyTorch conv
-        obs = obs.permute(0, 3, 1, 2)
-        goal = goal.permute(0, 3, 1, 2)
-
-        # Early goal concat on channel dim: (B, 6, H, W)
-        x = torch.cat([obs, goal], dim=1)
-
-        # Encode
-        encoding = self.encoder(x)  # (B, 512)
+        if self.encoder_name == "resnetv1-34-bridge":
+            # ResNet early-fusion: normalize -> NCHW -> channel concat -> encode
+            obs = obs_image.float() / 127.5 - 1.0
+            goal = goal_image.float() / 127.5 - 1.0
+            obs = obs.permute(0, 3, 1, 2)
+            goal = goal.permute(0, 3, 1, 2)
+            x = torch.cat([obs, goal], dim=1)  # (B, 6, H, W)
+            encoding = self.encoder(x)  # (B, 512)
+        else:
+            # Pretrained late-fusion: shared encoder on each image, then concat
+            z_obs = self.pretrained_encoder(obs_image)
+            z_goal = self.pretrained_encoder(goal_image)
+            encoding = torch.cat([z_obs, z_goal], dim=-1)  # (B, 1536)
 
         # Concat proprio
         if self.use_proprio and proprio is not None:
@@ -241,7 +278,6 @@ class GCBCPolicy(nn.Module):
 
         # MLP
         if not train:
-            # Disable dropout at eval
             self.mlp.eval()
         else:
             self.mlp.train()
