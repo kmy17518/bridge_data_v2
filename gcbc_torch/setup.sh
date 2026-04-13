@@ -38,9 +38,9 @@ pip install tensorflow
 echo "Installing dependencies..."
 pip install wandb matplotlib tqdm Pillow av pandas ml_collections
 
-# Pretrained vision encoder dependencies (DINOv2, SigLIP via HuggingFace Transformers)
+# Pretrained vision encoder dependencies (DINOv2, SigLIP, DINOv3 via HuggingFace Transformers)
 echo "Installing pretrained encoder dependencies..."
-pip install -U transformers safetensors "huggingface_hub[cli]"
+pip install -U "transformers>=4.56.0" safetensors "huggingface_hub[cli]" packaging
 
 echo ""
 echo "=== Setup complete ==="
