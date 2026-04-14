@@ -213,11 +213,7 @@ class PretrainedVisionEncoder(nn.Module):
         else:
             x = self._preprocess_siglip(x)
 
-        if self.freeze:
-            with torch.no_grad():
-                outputs = self.backbone(pixel_values=x)
-        else:
-            outputs = self.backbone(pixel_values=x)
+        outputs = self.backbone(pixel_values=x)
 
         if self.encoder_type == "dinov2-base":
             # CLS token from the last hidden state
