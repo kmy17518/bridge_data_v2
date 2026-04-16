@@ -227,6 +227,9 @@ def main():
                         help="Skip episodes whose .tfrecord already exists")
     parser.add_argument("--split_json", type=str, default=None,
                         help='Path to JSON with {"train": [...], "val": [...], "test": [...]} episode IDs')
+    parser.add_argument("--suffix", type=str, default=None,
+                        help='Directory name suffix inserted before seed, e.g. "d0-goal" gives '
+                             'ispatialgym-demos-d0-goal-seed{seed}')
     args = parser.parse_args()
 
     # Validate mutually exclusive data source options
@@ -255,11 +258,13 @@ def main():
         for pq in sorted(glob.glob(os.path.join(args.data_dir, "*.parquet"))):
             episodes.append((pq, args.video_dir))
     else:
+        suffix_part = f"-{args.suffix}" if args.suffix else ""
         for seed in seeds:
             for tid in task_ids:
-                data_dir = f"datasets/ispatialgym-demos-seed{seed}/data/task-{tid:04d}"
+                demos_name = f"ispatialgym-demos{suffix_part}-seed{seed}"
+                data_dir = f"datasets/{demos_name}/data/task-{tid:04d}"
                 video_dir = args.video_dir or os.path.join(
-                    f"datasets/ispatialgym-demos-seed{seed}", "videos", f"task-{tid:04d}")
+                    f"datasets/{demos_name}", "videos", f"task-{tid:04d}")
                 for pq in sorted(glob.glob(os.path.join(data_dir, "*.parquet"))):
                     episodes.append((pq, video_dir))
 
