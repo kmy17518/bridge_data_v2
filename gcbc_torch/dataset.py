@@ -116,8 +116,8 @@ def _add_goals(traj):
 def _normalize_actions(traj):
     """Normalize actions to [-1, 1] using JOINT_RANGE bounds.
 
-    Non-gripper dims: min-max normalization.
-    Gripper dims [14, 22]: pass through (already [-1, 1] in raw data).
+    Trunk + arm dims: min-max normalization to [-1, 1].
+    Base + gripper dims [0, 1, 2, 14, 22]: pass through (already in [-1, 1]).
     """
     traj["actions"] = normalize_actions_bounds_tf(traj["actions"])
     return traj
