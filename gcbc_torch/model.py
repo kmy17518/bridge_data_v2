@@ -166,10 +166,10 @@ class GCBCPolicy(nn.Module):
         6. Linear -> action_dim (means)
         7. Fixed std = 1.0
 
-    B) Pretrained encoder (dinov2-base, siglip-base):
+    B) Pretrained encoder (dinov2-base, siglip-base, dinov3-vitl16):
         1. Shared encoder processes obs and goal separately
-        2. Late fusion: cat(z_obs, z_goal) -> 1536-dim
-        3. Optional proprio concat -> 1536 + proprio_dim
+        2. Late fusion: cat(z_obs, z_goal) -> 2 * encoder_dim
+        3. Optional proprio concat -> 2 * encoder_dim + proprio_dim
         4. Same MLP and action head
     """
 
@@ -193,7 +193,7 @@ class GCBCPolicy(nn.Module):
             )
             encoder_out_dim = self.encoder.output_dim  # 512
         else:
-            # Pretrained late-fusion path (dinov2-base, siglip-base)
+            # Pretrained late-fusion path (dinov2-base, siglip-base, dinov3-vitl16)
             from .pretrained_vision import PretrainedVisionEncoder
 
             freeze = not train_encoder
@@ -206,7 +206,7 @@ class GCBCPolicy(nn.Module):
             )
             self._encoder_frozen = freeze
             # Late fusion: obs_features + goal_features
-            encoder_out_dim = self.pretrained_encoder.output_dim * 2  # 768*2 = 1536
+            encoder_out_dim = self.pretrained_encoder.output_dim * 2
 
         # MLP policy head
         if use_proprio:
@@ -270,7 +270,7 @@ class GCBCPolicy(nn.Module):
             # Pretrained late-fusion: shared encoder on each image, then concat
             z_obs = self.pretrained_encoder(obs_image)
             z_goal = self.pretrained_encoder(goal_image)
-            encoding = torch.cat([z_obs, z_goal], dim=-1)  # (B, 1536)
+            encoding = torch.cat([z_obs, z_goal], dim=-1)
 
         # Concat proprio
         if self.use_proprio and proprio is not None:

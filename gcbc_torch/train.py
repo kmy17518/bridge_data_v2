@@ -464,12 +464,14 @@ def main():
     parser.add_argument("--save_dir", type=str, default="outputs/gcbc_torch")
     parser.add_argument("--run_name", type=str, default="gcbc_torch")
     parser.add_argument("--encoder", type=str, default="resnetv1-34-bridge",
-                        choices=["resnetv1-34-bridge", "dinov2-base", "siglip-base"],
-                        help="Vision encoder: resnetv1-34-bridge, dinov2-base, siglip-base")
+                        choices=["resnetv1-34-bridge", "dinov2-base", "siglip-base",
+                                 "dinov3-vitl16"],
+                        help="Vision encoder: resnetv1-34-bridge, dinov2-base, "
+                             "siglip-base, dinov3-vitl16")
     parser.add_argument("--encoder_model_name_or_path", type=str, default=None,
                         help="HF repo id or local dir for pretrained encoder weights")
     parser.add_argument("--train_encoder", action="store_true",
-                        help="Unfreeze pretrained encoder (dinov2/siglip only)")
+                        help="Unfreeze pretrained encoder (dinov2/siglip/dinov3 only)")
 
     parser.add_argument("--num_steps", type=int, default=None,
                         help="Total training steps (step mode, default)")

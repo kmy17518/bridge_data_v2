@@ -91,6 +91,7 @@ class TorchGCBCEvalPolicy:
         else:
             # Detect encoder from checkpoint (default resnet for old checkpoints)
             encoder = ckpt_args.get("encoder", "resnetv1-34-bridge")
+            encoder_config_dict = ckpt.get("encoder_config")
             self.model = GCBCPolicy(
                 action_dim=action_dim,
                 use_proprio=use_proprio,
@@ -99,6 +100,7 @@ class TorchGCBCEvalPolicy:
                 encoder_model_name_or_path=ckpt_args.get("encoder_model_name_or_path"),
                 train_encoder=ckpt_args.get("train_encoder", False),
                 load_pretrained_weights=False,
+                encoder_config_dict=encoder_config_dict,
             ).to(self.device)
             self.model.load_state_dict(ckpt["model_state_dict"])
             self.target_state_dict = None
