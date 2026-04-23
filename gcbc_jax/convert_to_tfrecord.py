@@ -351,25 +351,29 @@ def main():
 
         print(f"  [{split}] {ep_name}: {len(actions)} transitions, goal {goal_img.shape}")
 
-    # Compute and save action + proprio normalization stats
-    all_actions = np.concatenate(all_actions, axis=0)
-    action_mean = all_actions.mean(axis=0)
-    action_std = np.clip(all_actions.std(axis=0), a_min=1e-3, a_max=None)
+    # Compute and save action + proprio normalization stats (only if train episodes exist)
+    if all_actions:
+        all_actions = np.concatenate(all_actions, axis=0)
+        action_mean = all_actions.mean(axis=0)
+        action_std = np.clip(all_actions.std(axis=0), a_min=1e-3, a_max=None)
 
-    all_proprios = np.concatenate(all_proprios, axis=0)
-    proprio_mean = all_proprios.mean(axis=0)
-    proprio_std = np.clip(all_proprios.std(axis=0), a_min=1e-3, a_max=None)
+        all_proprios = np.concatenate(all_proprios, axis=0)
+        proprio_mean = all_proprios.mean(axis=0)
+        proprio_std = np.clip(all_proprios.std(axis=0), a_min=1e-3, a_max=None)
 
-    stats = {
-        "action": {"mean": action_mean.tolist(), "std": action_std.tolist()},
-        "proprio": {"mean": proprio_mean.tolist(), "std": proprio_std.tolist()},
-        "image_encoding": "raw" if args.no_loss else "jpeg",
-    }
+        stats = {
+            "action": {"mean": action_mean.tolist(), "std": action_std.tolist()},
+            "proprio": {"mean": proprio_mean.tolist(), "std": proprio_std.tolist()},
+            "image_encoding": "raw" if args.no_loss else "jpeg",
+        }
 
-    stats_path = os.path.join(args.output_dir, "action_proprio_metadata.json")
-    with open(stats_path, "w") as f:
-        json.dump(stats, f, indent=2)
-    print(f"\nStats saved to {stats_path}")
+        stats_path = os.path.join(args.output_dir, "action_proprio_metadata.json")
+        with open(stats_path, "w") as f:
+            json.dump(stats, f, indent=2)
+        print(f"\nStats saved to {stats_path}")
+    else:
+        action_mean = action_std = proprio_mean = proprio_std = None
+        print("\nNo train episodes — skipping action/proprio normalization stats")
 
     # Save the split assignment so it can be reused via --split_json
     split_by_name = {"train": [], "val": [], "test": []}
@@ -385,10 +389,11 @@ def main():
         with open(test_episodes_path, "w") as f:
             json.dump(test_episode_metadata, f, indent=2)
         print(f"Test episodes JSON saved to {test_episodes_path} ({len(test_episode_metadata)} episodes)")
-    print(f"Action mean: {action_mean[:5]}...")
-    print(f"Action std:  {action_std[:5]}...")
-    print(f"Proprio dim: {proprio_mean.shape[0]}, mean[:5]: {proprio_mean[:5]}...")
-    print(f"Proprio std[:5]: {proprio_std[:5]}...")
+    if action_mean is not None:
+        print(f"Action mean: {action_mean[:5]}...")
+        print(f"Action std:  {action_std[:5]}...")
+        print(f"Proprio dim: {proprio_mean.shape[0]}, mean[:5]: {proprio_mean[:5]}...")
+        print(f"Proprio std[:5]: {proprio_std[:5]}...")
     n_train = sum(1 for s in episode_to_split.values() if s == "train")
     n_val = sum(1 for s in episode_to_split.values() if s == "val")
     n_test = sum(1 for s in episode_to_split.values() if s == "test")
