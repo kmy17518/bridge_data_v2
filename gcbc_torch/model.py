@@ -177,14 +177,17 @@ class GCBCPolicy(nn.Module):
                  hidden_dims=(256, 256, 256), dropout_rate=0.1,
                  encoder="resnetv1-34-bridge", encoder_model_name_or_path=None,
                  train_encoder=False, load_pretrained_weights=True,
-                 encoder_config_dict=None):
+                 encoder_config_dict=None, use_image=True):
         super().__init__()
         self.action_dim = action_dim
         self.use_proprio = use_proprio
+        self.use_image = use_image
         self.encoder_name = encoder
         self._encoder_frozen = False
 
-        if encoder == "resnetv1-34-bridge":
+        if not use_image:
+            encoder_out_dim = 0
+        elif encoder == "resnetv1-34-bridge":
             # Existing ResNet early-fusion path.
             # Attribute name "encoder" matches old checkpoint state_dict keys.
             self.encoder = ResNetV1Encoder(
@@ -241,7 +244,7 @@ class GCBCPolicy(nn.Module):
     def train(self, mode=True):
         """Override to keep frozen pretrained encoder in eval mode."""
         super().train(mode)
-        if self._encoder_frozen:
+        if self._encoder_frozen and hasattr(self, "pretrained_encoder"):
             self.pretrained_encoder.eval()
         return self
 
@@ -258,23 +261,30 @@ class GCBCPolicy(nn.Module):
             means: (B, action_dim) action means
             log_stds: (B, action_dim) log standard deviations (fixed at 0)
         """
-        if self.encoder_name == "resnetv1-34-bridge":
-            # ResNet early-fusion: normalize -> NCHW -> channel concat -> encode
-            obs = obs_image.float() / 127.5 - 1.0
-            goal = goal_image.float() / 127.5 - 1.0
-            obs = obs.permute(0, 3, 1, 2)
-            goal = goal.permute(0, 3, 1, 2)
-            x = torch.cat([obs, goal], dim=1)  # (B, 6, H, W)
-            encoding = self.encoder(x)  # (B, 512)
+        if self.use_image:
+            if self.encoder_name == "resnetv1-34-bridge":
+                # ResNet early-fusion: normalize -> NCHW -> channel concat -> encode
+                obs = obs_image.float() / 127.5 - 1.0
+                goal = goal_image.float() / 127.5 - 1.0
+                obs = obs.permute(0, 3, 1, 2)
+                goal = goal.permute(0, 3, 1, 2)
+                x = torch.cat([obs, goal], dim=1)  # (B, 6, H, W)
+                encoding = self.encoder(x)  # (B, 512)
+            else:
+                # Pretrained late-fusion: shared encoder on each image, then concat
+                z_obs = self.pretrained_encoder(obs_image)
+                z_goal = self.pretrained_encoder(goal_image)
+                encoding = torch.cat([z_obs, z_goal], dim=-1)
         else:
-            # Pretrained late-fusion: shared encoder on each image, then concat
-            z_obs = self.pretrained_encoder(obs_image)
-            z_goal = self.pretrained_encoder(goal_image)
-            encoding = torch.cat([z_obs, z_goal], dim=-1)
+            # state_only_* ablations: no image features; proprio-only path uses empty encoding.
+            encoding = torch.zeros(obs_image.shape[0], 0, device=obs_image.device)
 
         # Concat proprio
         if self.use_proprio and proprio is not None:
-            encoding = torch.cat([encoding, proprio], dim=-1)
+            if encoding.shape[-1] > 0:
+                encoding = torch.cat([encoding, proprio], dim=-1)
+            else:
+                encoding = proprio
 
         # MLP
         if not train:

@@ -18,6 +18,8 @@ from .model import GCBCPolicy
 from .proprio import (
     extract_proprio_np, normalize_proprio_bounds_np,
     denormalize_actions_bounds_np, ACTION_BOUNDS_LOW_23,
+    apply_ablation_to_proprio, ablation_uses_image, ablation_uses_proprio,
+    ablation_proprio_dim, parse_base_proprio_keys,
 )
 
 
@@ -28,12 +30,28 @@ class TorchGCBCEvalPolicy:
                  use_proprio: bool = False, add_eef_proprio: bool = False,
                  normalize_proprio: bool = False,
                  action_metadata_path: str | None = None,
-                 image_size: int = 256):
+                 image_size: int = 256,
+                 proprio_ablation_mode: str | None = None,
+                 base_proprio_keys: str | None = None):
         self.use_proprio = use_proprio
         self.add_eef_proprio = add_eef_proprio
         self.normalize_proprio = normalize_proprio
         self.action_metadata_path = action_metadata_path
         self.image_size = image_size
+        self.proprio_ablation_mode = proprio_ablation_mode
+
+        # Ablation mode overrides
+        self._use_ablation = proprio_ablation_mode is not None
+        if self._use_ablation:
+            self._base_keys = parse_base_proprio_keys(
+                base_proprio_keys if base_proprio_keys is not None else "base_qvel"
+            )
+            self._ablation_use_image = ablation_uses_image(proprio_ablation_mode)
+            self._ablation_use_proprio = ablation_uses_proprio(proprio_ablation_mode)
+            # Ring buffer (capacity 64) for shuffled modes
+            _buf_dim = 37  # always store full 37-dim normalized
+            self._eval_proprio_buffer = np.zeros((64, _buf_dim), dtype=np.float32)
+            self._eval_buf_count = 0  # total entries pushed so far
 
         # Load z-score stats for legacy checkpoints
         if action_metadata_path is not None:
@@ -46,10 +64,16 @@ class TorchGCBCEvalPolicy:
         action_dim = len(ACTION_BOUNDS_LOW_23)  # 23 for R1Pro
 
         # Determine proprio dimension
-        if use_proprio:
+        if self._use_ablation:
+            # _base_keys set above; if loading from checkpoint, may override below
+            proprio_dim = ablation_proprio_dim(proprio_ablation_mode, self._base_keys)
+            use_proprio_model = self._ablation_use_proprio
+        elif use_proprio:
             proprio_dim = 37 if add_eef_proprio else 23
+            use_proprio_model = True
         else:
             proprio_dim = 23
+            use_proprio_model = False
 
         # Load goal image — resize to match training resolution (convert_to_tfrecord.py)
         goal_img = np.array(
@@ -67,12 +91,16 @@ class TorchGCBCEvalPolicy:
 
         # Auto-detect policy type from checkpoint
         ckpt_args = ckpt.get("args", {})
+        self._proprio_noise_std = float(ckpt_args.get("proprio_noise_std", 1.0))
+        if self._use_ablation and ckpt_args.get("base_proprio_keys"):
+            self._base_keys = parse_base_proprio_keys(ckpt_args["base_proprio_keys"])
+            proprio_dim = ablation_proprio_dim(proprio_ablation_mode, self._base_keys)
         policy_type = ckpt_args.get("policy", "gcbc")
 
         if policy_type == "gc_iql":
             self.model = GCIQLPolicy(
                 action_dim=action_dim,
-                use_proprio=use_proprio,
+                use_proprio=use_proprio_model,
                 proprio_dim=proprio_dim,
             ).to(self.device)
             self.model.load_state_dict(ckpt["model_state_dict"])
@@ -81,7 +109,7 @@ class TorchGCBCEvalPolicy:
         elif policy_type == "gc_ddpm_bc":
             self.model = GCDDPMBCPolicy(
                 action_dim=action_dim,
-                use_proprio=use_proprio,
+                use_proprio=use_proprio_model,
                 proprio_dim=proprio_dim,
                 diffusion_steps=ckpt_args.get("diffusion_steps", 20),
             ).to(self.device)
@@ -92,22 +120,30 @@ class TorchGCBCEvalPolicy:
             # Detect encoder from checkpoint (default resnet for old checkpoints)
             encoder = ckpt_args.get("encoder", "resnetv1-34-bridge")
             encoder_config_dict = ckpt.get("encoder_config")
+            _ablation_use_image_flag = (
+                self._ablation_use_image if self._use_ablation else True
+            )
             self.model = GCBCPolicy(
                 action_dim=action_dim,
-                use_proprio=use_proprio,
+                use_proprio=use_proprio_model,
                 proprio_dim=proprio_dim,
                 encoder=encoder,
                 encoder_model_name_or_path=ckpt_args.get("encoder_model_name_or_path"),
                 train_encoder=ckpt_args.get("train_encoder", False),
                 load_pretrained_weights=False,
                 encoder_config_dict=encoder_config_dict,
+                use_image=_ablation_use_image_flag,
             ).to(self.device)
             self.model.load_state_dict(ckpt["model_state_dict"])
             self.target_state_dict = None
             print(f"Loaded PyTorch GCBCPolicy from {ckpt_path} (encoder={encoder})")
 
         self.model.eval()
-        if use_proprio:
+        if self._use_ablation:
+            print(f"  Ablation mode: {proprio_ablation_mode} | "
+                  f"use_image={self._ablation_use_image} use_proprio={self._ablation_use_proprio} "
+                  f"proprio_dim={proprio_dim}")
+        elif use_proprio:
             print(f"  Proprio: {proprio_dim}-dim (add_eef={add_eef_proprio}, "
                   f"normalize={normalize_proprio})")
 
@@ -142,7 +178,41 @@ class TorchGCBCEvalPolicy:
         goal_t = torch.from_numpy(self.goal_image[np.newaxis]).to(self.device)
 
         # Extract proprio
-        if self.use_proprio:
+        if self._use_ablation:
+            proprio_256 = obs["robot_r1::proprio"].cpu().numpy().astype(np.float32)
+            # Always extract and normalize full 37-dim for ablation
+            proprio_37 = extract_proprio_np(proprio_256, add_eef=True)
+            proprio_37 = normalize_proprio_bounds_np(proprio_37, add_eef=True)
+            # Push into ring buffer
+            buf_idx = self._eval_buf_count % 64
+            self._eval_proprio_buffer[buf_idx] = proprio_37
+            self._eval_buf_count += 1
+
+            if self.proprio_ablation_mode.startswith("shuffled_") and self._eval_buf_count > 1:
+                # Pop a random past entry from the buffer
+                filled = min(self._eval_buf_count - 1, 64)  # exclude current
+                rng = np.random.default_rng()
+                rand_idx = rng.integers(0, filled)
+                # Map to actual buffer slot (most recent is buf_idx, go back rand_idx+1)
+                pick_idx = (buf_idx - 1 - rand_idx) % 64
+                proprio_37_to_use = self._eval_proprio_buffer[pick_idx]
+            else:
+                proprio_37_to_use = proprio_37
+
+            proprio_t_full = torch.from_numpy(proprio_37_to_use[np.newaxis]).to(self.device)
+            if self._ablation_use_proprio:
+                raw_state_t = torch.from_numpy(
+                    proprio_256[np.newaxis]).to(self.device, dtype=torch.float32)
+                proprio_t = apply_ablation_to_proprio(
+                    proprio_t_full,
+                    self.proprio_ablation_mode,
+                    raw_state_256=raw_state_t,
+                    base_keys=self._base_keys,
+                    noise_std=self._proprio_noise_std,
+                )
+            else:
+                proprio_t = None
+        elif self.use_proprio:
             proprio_256 = obs["robot_r1::proprio"].cpu().numpy().astype(np.float32)
             proprio = extract_proprio_np(proprio_256, add_eef=self.add_eef_proprio)
             if self.normalize_proprio:

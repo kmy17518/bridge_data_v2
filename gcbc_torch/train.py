@@ -33,6 +33,14 @@ from .dataset import build_tf_dataset, load_raw_trajectories, tf_batch_to_torch,
 from .diffusion_model import GCDDPMBCPolicy
 from .iql_model import GCIQLPolicy
 from .model import GCBCPolicy
+from .proprio import (
+    ABLATION_MODES,
+    ablation_uses_image,
+    ablation_uses_proprio,
+    ablation_proprio_dim,
+    apply_ablation_to_proprio,
+    parse_base_proprio_keys,
+)
 from .vis import visualize_predictions
 
 
@@ -65,6 +73,30 @@ def train(args):
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
     os.makedirs(args.save_dir, exist_ok=True)
 
+    # Ablation mode resolution
+    _use_ablation = False
+    _ablation_mode = None
+    _use_image = True
+    _needs_proprio = args.use_proprio
+    _effective_proprio_dim = None  # resolved after example batch
+
+    _base_keys = parse_base_proprio_keys(args.base_proprio_keys)
+
+    if args.proprio_ablation_mode is not None:
+        _use_ablation = True
+        _ablation_mode = args.proprio_ablation_mode
+        if args.policy != "gcbc":
+            raise ValueError(
+                "--proprio_ablation_mode is only wired in the training loop for "
+                f"--policy gcbc (GCBCPolicy + apply_ablation_to_proprio). Got --policy {args.policy}."
+            )
+        _use_image = ablation_uses_image(_ablation_mode)
+        _needs_proprio = ablation_uses_proprio(_ablation_mode)
+        _effective_proprio_dim = ablation_proprio_dim(_ablation_mode, _base_keys)
+
+    _train_rng = torch.Generator(device=device)
+    _train_rng.manual_seed(args.seed)
+
     # Save train config for eval_ispatialgym_batched.py and reproducibility
     _policy_type_map = {"gcbc": "gcbc_torch", "gc_ddpm_bc": "gcbc_torch", "gc_iql": "gcbc_torch"}
     train_config = {
@@ -72,6 +104,9 @@ def train(args):
         "use_proprio": args.use_proprio,
         "add_eef_proprio": args.add_eef_proprio,
         "normalize_proprio": args.normalize_proprio,
+        "proprio_ablation_mode": args.proprio_ablation_mode,
+        "base_proprio_keys": args.base_proprio_keys,
+        "proprio_noise_std": args.proprio_noise_std,
         # Training hyperparams for reproducibility
         "policy_arch": args.policy,
         "encoder": args.encoder,
@@ -134,6 +169,7 @@ def train(args):
         use_proprio=args.use_proprio, add_eef_proprio=args.add_eef_proprio,
         normalize_proprio=args.normalize_proprio,
         image_encoding=image_encoding,
+        force_full_proprio=_use_ablation,
     )
 
     val_dataset = build_tf_dataset(
@@ -142,6 +178,7 @@ def train(args):
         use_proprio=args.use_proprio, add_eef_proprio=args.add_eef_proprio,
         normalize_proprio=args.normalize_proprio,
         image_encoding=image_encoding,
+        force_full_proprio=_use_ablation,
     )
 
     # Load vis trajectories
@@ -171,6 +208,7 @@ def train(args):
             use_proprio=args.use_proprio, add_eef_proprio=args.add_eef_proprio,
             normalize_proprio=args.normalize_proprio,
             image_encoding=image_encoding,
+            force_full_proprio=_use_ablation,
         )
     else:
         total_steps = args.num_steps or 100000
@@ -188,7 +226,11 @@ def train(args):
     print(f"Obs image shape: {example_batch['obs_image'].shape}")
     print(f"Goal image shape: {example_batch['goal_image'].shape}")
 
-    if args.use_proprio:
+    if _use_ablation:
+        proprio_dim = _effective_proprio_dim
+        print(f"Ablation mode: {_ablation_mode} | use_image={_use_image} "
+              f"use_proprio={_needs_proprio} proprio_dim={proprio_dim}")
+    elif args.use_proprio:
         proprio_dim = example_batch["obs_proprio"].shape[-1]
         print(f"Proprio dim: {proprio_dim} (add_eef={args.add_eef_proprio}, "
               f"normalize={args.normalize_proprio})")
@@ -210,6 +252,9 @@ def train(args):
     encoder_config_dict = ckpt.get("encoder_config") if ckpt is not None else None
 
     # Create model
+    _model_use_proprio = _needs_proprio if _use_ablation else args.use_proprio
+    _model_proprio_dim = proprio_dim if _model_use_proprio else 23
+
     if args.policy == "gc_iql":
         model = GCIQLPolicy(
             action_dim=action_dim,
@@ -238,8 +283,8 @@ def train(args):
     else:
         model = GCBCPolicy(
             action_dim=action_dim,
-            use_proprio=args.use_proprio,
-            proprio_dim=proprio_dim if args.use_proprio else 23,
+            use_proprio=_model_use_proprio,
+            proprio_dim=_model_proprio_dim,
             hidden_dims=(256, 256, 256),
             dropout_rate=0.1,
             encoder=args.encoder,
@@ -247,6 +292,7 @@ def train(args):
             train_encoder=args.train_encoder,
             load_pretrained_weights=not args.resume,
             encoder_config_dict=encoder_config_dict,
+            use_image=_use_image,
         ).to(device)
 
     n_total = sum(p.numel() for p in model.parameters())
@@ -324,7 +370,22 @@ def train(args):
             obs_image = batch["obs_image"].to(device)
             goal_image = batch["goal_image"].to(device)
             actions = batch["actions"].to(device)
-            proprio = batch["obs_proprio"].to(device) if args.use_proprio else None
+            if _use_ablation:
+                raw_proprio = batch["obs_proprio"].to(device)  # always (B, 37)
+                raw_state = batch.get("obs_state256")
+                if raw_state is not None:
+                    raw_state = raw_state.to(device)
+                proprio = apply_ablation_to_proprio(
+                    raw_proprio,
+                    _ablation_mode,
+                    seed=args.seed,
+                    rng=_train_rng,
+                    raw_state_256=raw_state,
+                    base_keys=_base_keys,
+                    noise_std=args.proprio_noise_std,
+                )
+            else:
+                proprio = batch["obs_proprio"].to(device) if args.use_proprio else None
             loss, metrics = model.compute_loss(obs_image, goal_image, actions, proprio)
 
         # Backward
@@ -383,7 +444,21 @@ def train(args):
                         v_obs = val_batch["obs_image"].to(device)
                         v_goal = val_batch["goal_image"].to(device)
                         v_actions = val_batch["actions"].to(device)
-                        v_proprio = val_batch["obs_proprio"].to(device) if args.use_proprio else None
+                        if _use_ablation:
+                            v_raw_proprio = val_batch["obs_proprio"].to(device)
+                            v_raw_state = val_batch.get("obs_state256")
+                            if v_raw_state is not None:
+                                v_raw_state = v_raw_state.to(device)
+                            v_proprio = apply_ablation_to_proprio(
+                                v_raw_proprio,
+                                _ablation_mode,
+                                seed=args.seed,
+                                raw_state_256=v_raw_state,
+                                base_keys=_base_keys,
+                                noise_std=args.proprio_noise_std,
+                            )
+                        else:
+                            v_proprio = val_batch["obs_proprio"].to(device) if args.use_proprio else None
                         _, v_metrics = model.compute_loss(v_obs, v_goal, v_actions, v_proprio)
                     val_metrics_list.append(v_metrics)
 
@@ -397,8 +472,8 @@ def train(args):
                     wandb.log({f"validation/{k}": v for k, v in val_summary.items()},
                               step=step)
 
-            # Visualization
-            if vis_trajs:
+            # Visualization (skip for ablation modes to avoid complexity)
+            if vis_trajs and not _use_ablation:
                 visualize_predictions(
                     model, vis_trajs, step=step,
                     save_dir=args.save_dir,
@@ -506,6 +581,22 @@ def main():
                         help="Extend to 37-dim by adding EEF pos+quat (requires --use_proprio)")
     parser.add_argument("--normalize_proprio", action="store_true",
                         help="Normalize proprio to [-1,1] using JOINT_RANGE bounds")
+    parser.add_argument("--proprio_ablation_mode", type=str, default=None,
+                        choices=list(ABLATION_MODES),
+                        help="Proprioception ablation mode. Replaces --use_proprio/--add_eef_proprio.")
+    parser.add_argument(
+        "--base_proprio_keys",
+        type=str,
+        default="base_qvel",
+        help="Comma-separated base fields for base_only / shuffled_base_only / state_only_base. "
+             "Options: base_qvel, base_qpos, robot_2d_ori, robot_pos (see gcbc_torch/proprio.py).",
+    )
+    parser.add_argument(
+        "--proprio_noise_std",
+        type=float,
+        default=1.0,
+        help="Std scale for random_noise_full_proprio_same_arch (Gaussian, default 1.0).",
+    )
 
     parser.add_argument("--log_interval", type=int, default=100,
                         help="Log every N steps (step mode) or N epochs (epoch mode)")
@@ -519,6 +610,8 @@ def main():
                         help="Resume from latest checkpoint in save_dir")
 
     args = parser.parse_args()
+    if args.proprio_ablation_mode is not None:
+        parse_base_proprio_keys(args.base_proprio_keys)  # validate early
     if args.encoder != "resnetv1-34-bridge" and args.policy != "gcbc":
         raise ValueError(
             f"Pretrained encoder '{args.encoder}' is only supported with "

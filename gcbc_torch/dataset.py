@@ -49,7 +49,7 @@ def _decode_jpeg_frames(jpeg_tensor):
 
 
 def _decode_example(example_proto, use_proprio=False, add_eef_proprio=False,
-                    image_encoding="jpeg"):
+                    image_encoding="jpeg", force_full_proprio=False):
     """Decode a single TFRecord example."""
     proto_spec = _proto_type_spec(image_encoding)
     features = {key: tf.io.FixedLenFeature([], tf.string) for key in proto_spec}
@@ -71,13 +71,20 @@ def _decode_example(example_proto, use_proprio=False, add_eef_proprio=False,
     obs_proprio = tensors["observations/state"]
     next_obs_proprio = tensors["next_observations/state"]
 
-    if use_proprio:
+    obs_state256 = None
+    next_state256 = None
+    if force_full_proprio:
+        obs_state256 = tf.cast(tensors["observations/state"], tf.float32)
+        next_state256 = tf.cast(tensors["next_observations/state"], tf.float32)
+        obs_proprio = extract_proprio_tf(obs_state256, add_eef=True)
+        next_obs_proprio = extract_proprio_tf(next_state256, add_eef=True)
+    elif use_proprio:
         obs_proprio = extract_proprio_tf(
             tf.cast(obs_proprio, tf.float32), add_eef=add_eef_proprio)
         next_obs_proprio = extract_proprio_tf(
             tf.cast(next_obs_proprio, tf.float32), add_eef=add_eef_proprio)
 
-    return {
+    out = {
         "observations": {
             "image": obs_images,
             "proprio": obs_proprio,
@@ -91,6 +98,10 @@ def _decode_example(example_proto, use_proprio=False, add_eef_proprio=False,
         "truncates": tensors["truncates"],
         "goal_image": goal_image,
     }
+    if obs_state256 is not None:
+        out["observations"]["state256"] = obs_state256
+        out["next_observations"]["state256"] = next_state256
+    return out
 
 
 def _add_goals(traj):
@@ -155,7 +166,8 @@ def build_tf_dataset(tfrecord_paths, batch_size, seed, train=True,
                      shuffle_buffer_size=25000,
                      use_proprio=False, add_eef_proprio=False,
                      normalize_proprio=False,
-                     image_encoding="jpeg"):
+                     image_encoding="jpeg",
+                     force_full_proprio=False):
     """Build a tf.data.Dataset that yields batches of transitions.
 
     Returns batches as numpy arrays (to be converted to PyTorch tensors).
@@ -173,7 +185,8 @@ def build_tf_dataset(tfrecord_paths, batch_size, seed, train=True,
     # Decode examples
     decode_fn = partial(_decode_example, use_proprio=use_proprio,
                         add_eef_proprio=add_eef_proprio,
-                        image_encoding=image_encoding)
+                        image_encoding=image_encoding,
+                        force_full_proprio=force_full_proprio)
     dataset = dataset.map(decode_fn, num_parallel_calls=tf.data.AUTOTUNE)
 
     # Normalize actions (always, using JOINT_RANGE bounds)
@@ -182,9 +195,10 @@ def build_tf_dataset(tfrecord_paths, batch_size, seed, train=True,
         num_parallel_calls=tf.data.AUTOTUNE)
 
     # Normalize proprio
-    if use_proprio and normalize_proprio:
+    _norm_add_eef = True if force_full_proprio else add_eef_proprio
+    if (force_full_proprio or (use_proprio and normalize_proprio)):
         dataset = dataset.map(
-            lambda t: _normalize_proprio(t, add_eef=add_eef_proprio),
+            lambda t: _normalize_proprio(t, add_eef=_norm_add_eef),
             num_parallel_calls=tf.data.AUTOTUNE)
 
     # Add goals
@@ -213,17 +227,20 @@ def build_tf_dataset(tfrecord_paths, batch_size, seed, train=True,
 
 def tf_batch_to_torch(batch, device="cpu"):
     """Convert a TF batch (numpy) to PyTorch tensors."""
-    return {
+    d = {
         "obs_image": torch.from_numpy(batch["observations"]["image"]),
         "goal_image": torch.from_numpy(batch["goals"]["image"]),
         "obs_proprio": torch.from_numpy(batch["observations"]["proprio"]),
         "actions": torch.from_numpy(batch["actions"]),
     }
+    if "state256" in batch["observations"]:
+        d["obs_state256"] = torch.from_numpy(batch["observations"]["state256"])
+    return d
 
 
 def tf_batch_to_torch_iql(batch, device="cpu"):
     """Convert a TF batch (numpy) to PyTorch tensors, including IQL fields."""
-    return {
+    d = {
         "obs_image": torch.from_numpy(batch["observations"]["image"]),
         "goal_image": torch.from_numpy(batch["goals"]["image"]),
         "obs_proprio": torch.from_numpy(batch["observations"]["proprio"]),
@@ -233,6 +250,10 @@ def tf_batch_to_torch_iql(batch, device="cpu"):
         "rewards": torch.from_numpy(batch["rewards"].astype("float32")),
         "masks": torch.from_numpy(batch["masks"].astype("float32")),
     }
+    if "state256" in batch["observations"]:
+        d["obs_state256"] = torch.from_numpy(batch["observations"]["state256"])
+        d["next_obs_state256"] = torch.from_numpy(batch["next_observations"]["state256"])
+    return d
 
 
 def load_raw_trajectories(tfrecord_paths, n=3, seed=42, image_encoding="jpeg"):
