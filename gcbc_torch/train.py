@@ -112,6 +112,7 @@ def train(args):
         "encoder": args.encoder,
         "encoder_model_name_or_path": args.encoder_model_name_or_path,
         "train_encoder": args.train_encoder,
+        "obs_horizon": args.obs_horizon,
         "batch_size": args.batch_size,
         "lr": args.lr,
         "warmup_steps": args.warmup_steps,
@@ -170,6 +171,7 @@ def train(args):
         normalize_proprio=args.normalize_proprio,
         image_encoding=image_encoding,
         force_full_proprio=_use_ablation,
+        obs_horizon=args.obs_horizon,
     )
 
     val_dataset = build_tf_dataset(
@@ -179,6 +181,7 @@ def train(args):
         normalize_proprio=args.normalize_proprio,
         image_encoding=image_encoding,
         force_full_proprio=_use_ablation,
+        obs_horizon=args.obs_horizon,
     )
 
     # Load vis trajectories
@@ -209,6 +212,7 @@ def train(args):
             normalize_proprio=args.normalize_proprio,
             image_encoding=image_encoding,
             force_full_proprio=_use_ablation,
+            obs_horizon=args.obs_horizon,
         )
     else:
         total_steps = args.num_steps or 100000
@@ -293,6 +297,7 @@ def train(args):
             load_pretrained_weights=not args.resume,
             encoder_config_dict=encoder_config_dict,
             use_image=_use_image,
+            obs_horizon=args.obs_horizon,
         ).to(device)
 
     n_total = sum(p.numel() for p in model.parameters())
@@ -547,6 +552,13 @@ def main():
                         help="HF repo id or local dir for pretrained encoder weights")
     parser.add_argument("--train_encoder", action="store_true",
                         help="Unfreeze pretrained encoder (dinov2/siglip/dinov3 only)")
+    parser.add_argument("--obs_horizon", type=int, default=1,
+                        help="Number of stacked observation frames (incl. current) "
+                             "fed to the policy. 1 = single-frame (original "
+                             "behavior, the default baseline); >1 gives the policy "
+                             "temporal history (e.g. 4 = ~0.4s at the 10Hz "
+                             "downsampled rate). Currently only supported with "
+                             "--policy gcbc.")
 
     parser.add_argument("--num_steps", type=int, default=None,
                         help="Total training steps (step mode, default)")
@@ -616,6 +628,19 @@ def main():
         raise ValueError(
             f"Pretrained encoder '{args.encoder}' is only supported with "
             f"--policy gcbc. Got --policy {args.policy}."
+        )
+    if args.obs_horizon < 1:
+        raise ValueError(f"--obs_horizon must be >= 1, got {args.obs_horizon}.")
+    if args.obs_horizon > 1 and args.policy != "gcbc":
+        raise ValueError(
+            "--obs_horizon > 1 (observation history) is currently only wired "
+            f"for --policy gcbc (GCBCPolicy). Got --policy {args.policy}."
+        )
+    if args.obs_horizon > 1 and args.proprio_ablation_mode is not None:
+        raise ValueError(
+            "--obs_horizon > 1 is not supported together with "
+            "--proprio_ablation_mode (the ablation transforms expect a single "
+            "proprio frame). Use obs_horizon=1 for ablation studies."
         )
     train(args)
 

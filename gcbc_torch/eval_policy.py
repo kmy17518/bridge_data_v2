@@ -7,6 +7,7 @@ the forward(obs) -> torch.Tensor(23,) interface expected by OmniGibson.
 import glob
 import json
 import os
+from collections import deque
 
 import numpy as np
 import torch
@@ -97,6 +98,14 @@ class TorchGCBCEvalPolicy:
             proprio_dim = ablation_proprio_dim(proprio_ablation_mode, self._base_keys)
         policy_type = ckpt_args.get("policy", "gcbc")
 
+        # Observation-history length the checkpoint was trained with. The
+        # rollout maintains a rolling buffer of the latest ``obs_horizon``
+        # frames (and proprio) so deployment matches the stacked-frame input
+        # the model expects. Defaults to 1 (single frame) for old checkpoints.
+        self.obs_horizon = int(ckpt_args.get("obs_horizon", 1))
+        self._obs_hist = deque(maxlen=self.obs_horizon)
+        self._proprio_hist = deque(maxlen=self.obs_horizon)
+
         if policy_type == "gc_iql":
             self.model = GCIQLPolicy(
                 action_dim=action_dim,
@@ -133,6 +142,7 @@ class TorchGCBCEvalPolicy:
                 load_pretrained_weights=False,
                 encoder_config_dict=encoder_config_dict,
                 use_image=_ablation_use_image_flag,
+                obs_horizon=self.obs_horizon,
             ).to(self.device)
             self.model.load_state_dict(ckpt["model_state_dict"])
             self.target_state_dict = None
@@ -173,9 +183,19 @@ class TorchGCBCEvalPolicy:
                 Image.fromarray(obs_image).resize((sz, sz))
             )
 
-        # Build tensors
-        obs_t = torch.from_numpy(obs_image[np.newaxis]).to(self.device)
+        # Build tensors. With obs history, push the current frame into the
+        # rolling buffer and stack the latest ``obs_horizon`` frames (oldest
+        # first), left-padding by repeating the earliest available frame at
+        # episode start -- matching the training-time windowing.
         goal_t = torch.from_numpy(self.goal_image[np.newaxis]).to(self.device)
+        if self.obs_horizon > 1:
+            self._obs_hist.append(obs_image)
+            frames = list(self._obs_hist)
+            frames = [frames[0]] * (self.obs_horizon - len(frames)) + frames
+            obs_t = torch.from_numpy(
+                np.stack(frames, axis=0)[np.newaxis]).to(self.device)
+        else:
+            obs_t = torch.from_numpy(obs_image[np.newaxis]).to(self.device)
 
         # Extract proprio
         if self._use_ablation:
@@ -229,6 +249,14 @@ class TorchGCBCEvalPolicy:
             proprio_t = torch.from_numpy(proprio[np.newaxis]).to(self.device)
         else:
             proprio_t = None
+
+        # Stack proprio history to match the model's expected (1, T, P) input.
+        if self.obs_horizon > 1 and proprio_t is not None:
+            self._proprio_hist.append(proprio_t.squeeze(0).detach().cpu().numpy())
+            ph = list(self._proprio_hist)
+            ph = [ph[0]] * (self.obs_horizon - len(ph)) + ph
+            proprio_t = torch.from_numpy(
+                np.stack(ph, axis=0)[np.newaxis]).to(self.device)
 
         # Run inference
         with torch.no_grad():
@@ -292,7 +320,10 @@ class TorchGCBCEvalPolicy:
         }
 
     def reset(self):
-        pass
+        # Clear the rolling observation/proprio history between episodes so a
+        # new rollout never sees the previous episode's frames.
+        self._obs_hist.clear()
+        self._proprio_hist.clear()
 
 
 def load_torch_gcbc_policy(checkpoint_dir: str, episode_dir: str,

@@ -124,6 +124,35 @@ def _add_goals(traj):
     return traj
 
 
+def _add_obs_history(traj, obs_horizon):
+    """Stack the past ``obs_horizon`` frames (incl. current) per timestep.
+
+    Operates on an intact trajectory (before ``unbatch``), since the post-
+    unbatch shuffle destroys temporal adjacency. For each timestep ``t`` we
+    gather observation frames ``[t-obs_horizon+1, ..., t]`` (oldest first),
+    clamping negative indices to 0 so episode starts repeat the first frame.
+
+    Shapes:
+        observations/image:   (T, H, W, 3) -> (T, obs_horizon, H, W, 3)
+        observations/proprio: (T, P)        -> (T, obs_horizon, P)
+
+    Only ``observations`` is windowed; ``goals`` and ``next_observations``
+    are left single-frame (the goal is fixed, and history is an obs-side
+    concept for the GCBC policy).
+    """
+    T = tf.shape(traj["observations"]["image"])[0]
+    # (T, obs_horizon) index matrix of clamped past-frame indices.
+    offsets = tf.range(-obs_horizon + 1, 1)  # [-(H-1), ..., -1, 0]
+    idx = tf.range(T)[:, tf.newaxis] + offsets[tf.newaxis, :]
+    idx = tf.maximum(idx, 0)
+
+    traj["observations"]["image"] = tf.gather(
+        traj["observations"]["image"], idx, axis=0)
+    traj["observations"]["proprio"] = tf.gather(
+        traj["observations"]["proprio"], idx, axis=0)
+    return traj
+
+
 def _normalize_actions(traj):
     """Normalize actions to [-1, 1] using JOINT_RANGE bounds.
 
@@ -167,10 +196,15 @@ def build_tf_dataset(tfrecord_paths, batch_size, seed, train=True,
                      use_proprio=False, add_eef_proprio=False,
                      normalize_proprio=False,
                      image_encoding="jpeg",
-                     force_full_proprio=False):
+                     force_full_proprio=False,
+                     obs_horizon=1):
     """Build a tf.data.Dataset that yields batches of transitions.
 
     Returns batches as numpy arrays (to be converted to PyTorch tensors).
+
+    When ``obs_horizon > 1``, each transition's ``obs_image`` / ``obs_proprio``
+    is a stack of the latest ``obs_horizon`` frames (see ``_add_obs_history``),
+    yielding shapes ``(B, obs_horizon, H, W, 3)`` / ``(B, obs_horizon, P)``.
     """
     from functools import partial
 
@@ -203,6 +237,12 @@ def build_tf_dataset(tfrecord_paths, batch_size, seed, train=True,
 
     # Add goals
     dataset = dataset.map(_add_goals, num_parallel_calls=tf.data.AUTOTUNE)
+
+    # Stack observation history (before unbatch, while trajectories are intact)
+    if obs_horizon > 1:
+        dataset = dataset.map(
+            lambda t: _add_obs_history(t, obs_horizon),
+            num_parallel_calls=tf.data.AUTOTUNE)
 
     # Unbatch trajectories into transitions
     dataset = dataset.unbatch()

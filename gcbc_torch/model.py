@@ -177,21 +177,26 @@ class GCBCPolicy(nn.Module):
                  hidden_dims=(256, 256, 256), dropout_rate=0.1,
                  encoder="resnetv1-34-bridge", encoder_model_name_or_path=None,
                  train_encoder=False, load_pretrained_weights=True,
-                 encoder_config_dict=None, use_image=True):
+                 encoder_config_dict=None, use_image=True, obs_horizon=1):
         super().__init__()
         self.action_dim = action_dim
         self.use_proprio = use_proprio
         self.use_image = use_image
         self.encoder_name = encoder
         self._encoder_frozen = False
+        # Number of stacked observation frames (incl. current). obs_horizon=1
+        # reproduces the original single-frame model exactly (same channel
+        # counts / state_dict shapes), so old checkpoints still load.
+        self.obs_horizon = obs_horizon
 
         if not use_image:
             encoder_out_dim = 0
         elif encoder == "resnetv1-34-bridge":
-            # Existing ResNet early-fusion path.
+            # ResNet early-fusion path: channel-stack the obs_horizon history
+            # frames with the goal frame -> 3*obs_horizon + 3 input channels.
             # Attribute name "encoder" matches old checkpoint state_dict keys.
             self.encoder = ResNetV1Encoder(
-                in_channels=6,
+                in_channels=3 * obs_horizon + 3,
                 add_spatial_coordinates=True,
             )
             encoder_out_dim = self.encoder.output_dim  # 512
@@ -208,12 +213,13 @@ class GCBCPolicy(nn.Module):
                 encoder_config_dict=encoder_config_dict,
             )
             self._encoder_frozen = freeze
-            # Late fusion: obs_features + goal_features
-            encoder_out_dim = self.pretrained_encoder.output_dim * 2
+            # Late fusion: per-frame obs features (obs_horizon of them) + goal.
+            encoder_out_dim = self.pretrained_encoder.output_dim * (obs_horizon + 1)
 
-        # MLP policy head
+        # MLP policy head. Proprio history is flattened, so it contributes
+        # proprio_dim per stacked frame.
         if use_proprio:
-            encoder_out_dim += proprio_dim
+            encoder_out_dim += proprio_dim * obs_horizon
 
         layers = []
         in_dim = encoder_out_dim
@@ -252,35 +258,49 @@ class GCBCPolicy(nn.Module):
         """Forward pass.
 
         Args:
-            obs_image: (B, H, W, 3) uint8 tensor (channels-last, matching JAX)
+            obs_image: observation image(s), channels-last uint8. Either
+                ``(B, H, W, 3)`` (single frame) or ``(B, obs_horizon, H, W, 3)``
+                (stacked history, oldest first / current last).
             goal_image: (B, H, W, 3) uint8 tensor
-            proprio: (B, proprio_dim) float tensor, optional
+            proprio: proprio float tensor, ``(B, proprio_dim)`` or
+                ``(B, obs_horizon, proprio_dim)``, optional
             train: bool, enables dropout
 
         Returns:
             means: (B, action_dim) action means
             log_stds: (B, action_dim) log standard deviations (fixed at 0)
         """
+        # Normalize obs to a stacked-frame layout (B, T, H, W, 3); a bare
+        # (B, H, W, 3) input is treated as a single-frame history (T=1).
+        if obs_image.dim() == 4:
+            obs_image = obs_image.unsqueeze(1)
+        B, T = obs_image.shape[0], obs_image.shape[1]
+
         if self.use_image:
             if self.encoder_name == "resnetv1-34-bridge":
-                # ResNet early-fusion: normalize -> NCHW -> channel concat -> encode
-                obs = obs_image.float() / 127.5 - 1.0
+                # ResNet early-fusion: normalize -> NCHW -> channel-stack all
+                # history frames + goal -> (B, 3T+3, H, W) -> encode.
+                obs = obs_image.float() / 127.5 - 1.0           # (B, T, H, W, 3)
+                obs = obs.permute(0, 1, 4, 2, 3)                # (B, T, 3, H, W)
+                obs = obs.reshape(B, T * 3, obs.shape[-2], obs.shape[-1])
                 goal = goal_image.float() / 127.5 - 1.0
-                obs = obs.permute(0, 3, 1, 2)
-                goal = goal.permute(0, 3, 1, 2)
-                x = torch.cat([obs, goal], dim=1)  # (B, 6, H, W)
+                goal = goal.permute(0, 3, 1, 2)                 # (B, 3, H, W)
+                x = torch.cat([obs, goal], dim=1)               # (B, 3T+3, H, W)
                 encoding = self.encoder(x)  # (B, 512)
             else:
-                # Pretrained late-fusion: shared encoder on each image, then concat
-                z_obs = self.pretrained_encoder(obs_image)
+                # Pretrained late-fusion: shared encoder on each history frame
+                # and the goal, then concat all features.
+                z_list = [self.pretrained_encoder(obs_image[:, t]) for t in range(T)]
                 z_goal = self.pretrained_encoder(goal_image)
-                encoding = torch.cat([z_obs, z_goal], dim=-1)
+                encoding = torch.cat(z_list + [z_goal], dim=-1)
         else:
             # state_only_* ablations: no image features; proprio-only path uses empty encoding.
-            encoding = torch.zeros(obs_image.shape[0], 0, device=obs_image.device)
+            encoding = torch.zeros(B, 0, device=obs_image.device)
 
-        # Concat proprio
+        # Concat proprio (flatten obs-history proprio (B, T, P) -> (B, T*P)).
         if self.use_proprio and proprio is not None:
+            if proprio.dim() == 3:
+                proprio = proprio.reshape(B, -1)
             if encoding.shape[-1] > 0:
                 encoding = torch.cat([encoding, proprio], dim=-1)
             else:
