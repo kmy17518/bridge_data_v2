@@ -46,6 +46,15 @@ def run_trajectory_inference(model, traj, device,
     else:
         proprio = np.zeros((T, action_dim), dtype=np.float32)
 
+    # Window observation history (oldest first, clamped at episode start) to
+    # match the stacked-frame input the model was trained with.
+    obs_horizon = getattr(model, "obs_horizon", 1)
+    if obs_horizon > 1:
+        idx = np.arange(T)[:, None] + np.arange(-obs_horizon + 1, 1)[None, :]
+        idx = np.clip(idx, 0, T - 1)
+        obs_images = obs_images[idx]   # (T, obs_horizon, H, W, 3)
+        proprio = proprio[idx]         # (T, obs_horizon, P)
+
     # Process in chunks
     all_pred = []
     model.eval()

@@ -6,6 +6,12 @@ matching the action vector layout (grippers interleaved between arms).
 Index references: PROPRIOCEPTION_INDICES["R1Pro"] from
     OmniGibson/omnigibson/learning/utils/eval_utils.py
 
+Cross-check: slices below match named fields in PROPRIOCEPTION_INDICES (base_qvel is
+rotated into base frame using yaw at state[..., 246]; arm/trunk/gripper/EEF slices
+match arm_left_qpos 158:165, gripper_left 193:195, arm_right 197:204, gripper_right
+232:234, trunk 236:240, EEF blocks 186:193 and 225:232). Run on real data:
+    python -m omnigibson.learning.verify_proprio_qpos_indices <episode.parquet>
+
 23-dim layout (matches action vector):
     [0:3]   base_qvel          -- base_link frame; rotated from world-frame
                                   observation.state[253:256] by yaw at
@@ -24,6 +30,8 @@ Index references: PROPRIOCEPTION_INDICES["R1Pro"] from
     [30:33] eef_right_pos      -- observation.state[225:228]
     [33:37] eef_right_quat     -- observation.state[228:232]
 """
+
+import math
 
 import numpy as np
 import torch
@@ -340,3 +348,228 @@ def denormalize_actions_bounds_torch(actions):
     for gi in ACTION_GRIPPER_INDICES:
         result[..., gi] = torch.where(result[..., gi] > 0, 1.0, -1.0)
     return result
+
+
+# ─────────────────────────────────────────────────────────────
+# Ablation-mode helpers
+# ─────────────────────────────────────────────────────────────
+from typing import Optional, Sequence, Tuple
+
+# Index slices within the 37-dim (add_eef=True) proprio vector:
+#   [0:3]   base_qvel
+#   [3:7]   trunk_qpos
+#   [7:14]  arm_left_qpos
+#   [14]    gripper_left
+#   [15:22] arm_right_qpos
+#   [22]    gripper_right
+#   [23:26] eef_left_pos
+#   [26:30] eef_left_quat
+#   [30:33] eef_right_pos
+#   [33:37] eef_right_quat
+
+_ARM_EEF_DIMS    = np.arange(3, 37)
+_NO_BASE_NO_EEF  = np.arange(3, 23)
+_FULL_23_DIMS    = np.arange(0, 23)
+_FULL_37_DIMS    = np.arange(0, 37)
+
+ABLATION_MODES = (
+    "image_only",
+    "full_proprio",
+    "full_proprio_eef",
+    "base_only",
+    "arm_eef_only",
+    "proprio_no_eef_no_base",
+    "zero_full_proprio_same_arch",
+    "zero_full_proprio_eef_same_arch",
+    "shuffled_full_proprio",
+    "shuffled_full_proprio_eef",
+    "shuffled_base_only",
+    "shuffled_arm_eef_only",
+    "random_noise_full_proprio_same_arch",
+    "state_only_full_proprio",
+    "state_only_base",
+    "state_only_arm_eef",
+)
+
+# Modes that index a contiguous subset of the 37-dim proprio (not base_only variants).
+_MODE_DIMS = {
+    "image_only":                           None,
+    "full_proprio":                         _FULL_23_DIMS,
+    "full_proprio_eef":                     _FULL_37_DIMS,
+    "arm_eef_only":                         _ARM_EEF_DIMS,
+    "proprio_no_eef_no_base":               _NO_BASE_NO_EEF,
+    "zero_full_proprio_same_arch":          _FULL_23_DIMS,
+    "zero_full_proprio_eef_same_arch":      _FULL_37_DIMS,
+    "shuffled_full_proprio":                _FULL_23_DIMS,
+    "shuffled_full_proprio_eef":            _FULL_37_DIMS,
+    "shuffled_arm_eef_only":                _ARM_EEF_DIMS,
+    "random_noise_full_proprio_same_arch":  _FULL_23_DIMS,
+    "state_only_full_proprio":              _FULL_23_DIMS,
+    "state_only_arm_eef":                   _ARM_EEF_DIMS,
+}
+
+# Optional raw-state keys for --base_proprio_keys (PROPRIOCEPTION_INDICES slices in 256-dim).
+VALID_BASE_PROPRIO_KEYS = frozenset(
+    {"base_qvel", "base_qpos", "robot_2d_ori", "robot_pos"}
+)
+BASE_KEY_DIMS = {
+    "base_qvel": 3,
+    "base_qpos": 3,
+    "robot_2d_ori": 1,
+    "robot_pos": 3,
+}
+
+
+def parse_base_proprio_keys(s: str) -> Tuple[str, ...]:
+    """Parse comma-separated base proprio keys; default semantics: base_qvel only."""
+    keys = tuple(k.strip() for k in (s or "").split(",") if k.strip())
+    if not keys:
+        return ("base_qvel",)
+    for k in keys:
+        if k not in VALID_BASE_PROPRIO_KEYS:
+            raise ValueError(
+                f"Unknown base proprio key {k!r}. Valid: {sorted(VALID_BASE_PROPRIO_KEYS)}"
+            )
+    return keys
+
+
+def base_proprio_keys_need_state256(keys: Sequence[str]) -> bool:
+    return any(k != "base_qvel" for k in keys)
+
+
+def _base_vector_dim(keys: Sequence[str]) -> int:
+    return sum(BASE_KEY_DIMS[k] for k in keys)
+
+
+def _norm_lin(x: torch.Tensor, low: torch.Tensor, high: torch.Tensor) -> torch.Tensor:
+    return 2.0 * (x - low) / (high - low + 1e-8) - 1.0
+
+
+def build_base_proprio_vector_torch(
+    proprio_37: torch.Tensor,
+    state_256: Optional[torch.Tensor],
+    base_keys: Tuple[str, ...],
+) -> torch.Tensor:
+    """Concatenate normalized base-related features (B, D). base_qvel comes from proprio_37[..., :3]."""
+    if base_proprio_keys_need_state256(base_keys) and state_256 is None:
+        raise ValueError(
+            "base_proprio_keys includes a field that requires raw 256-dim state "
+            "(obs_state256 in batch, or full proprio tensor at eval)."
+        )
+    device = proprio_37.device
+    dtype = proprio_37.dtype
+    parts = []
+    for key in base_keys:
+        if key == "base_qvel":
+            parts.append(proprio_37[..., 0:3])
+        elif key == "base_qpos":
+            assert state_256 is not None
+            sl = state_256[..., 244:247]
+            low = torch.tensor([-5.0, -5.0, -math.pi], device=device, dtype=dtype)
+            high = torch.tensor([5.0, 5.0, math.pi], device=device, dtype=dtype)
+            parts.append(_norm_lin(sl, low, high))
+        elif key == "robot_2d_ori":
+            assert state_256 is not None
+            sl = state_256[..., 149:150]
+            low = torch.tensor([-math.pi], device=device, dtype=dtype)
+            high = torch.tensor([math.pi], device=device, dtype=dtype)
+            parts.append(_norm_lin(sl, low, high))
+        elif key == "robot_pos":
+            assert state_256 is not None
+            sl = state_256[..., 140:143]
+            low = torch.tensor([-25.0, -25.0, -0.5], device=device, dtype=dtype)
+            high = torch.tensor([25.0, 25.0, 5.0], device=device, dtype=dtype)
+            parts.append(_norm_lin(sl, low, high))
+    return torch.cat(parts, dim=-1)
+
+
+def ablation_uses_image(mode: str) -> bool:
+    return not mode.startswith("state_only")
+
+
+def ablation_uses_proprio(mode: str) -> bool:
+    return mode != "image_only"
+
+
+def ablation_proprio_dim(
+    mode: str,
+    base_keys: Tuple[str, ...] = ("base_qvel",),
+) -> int:
+    if mode == "image_only":
+        return 0
+    if mode in ("base_only", "shuffled_base_only", "state_only_base"):
+        return _base_vector_dim(base_keys)
+    dims = _MODE_DIMS.get(mode)
+    return 0 if dims is None else len(dims)
+
+
+def _shuffle_batch(
+    selected: torch.Tensor,
+    seed: int,
+    rng: Optional[torch.Generator],
+) -> torch.Tensor:
+    B = selected.shape[0]
+    if B <= 1:
+        return selected
+    g = rng
+    if g is None:
+        g = torch.Generator(device=selected.device)
+        g.manual_seed(seed)
+    perm = torch.randperm(B, generator=g, device=selected.device)
+    return selected[perm]
+
+
+def apply_ablation_to_proprio(
+    proprio: torch.Tensor,
+    mode: str,
+    seed: int = 42,
+    rng: Optional[torch.Generator] = None,
+    raw_state_256: Optional[torch.Tensor] = None,
+    base_keys: Tuple[str, ...] = ("base_qvel",),
+    noise_std: float = 1.0,
+) -> Optional[torch.Tensor]:
+    """Transform a (B, 37) normalized proprio tensor per ablation mode.
+
+    Returns None for image_only (no proprio), or (B, D') for all other modes.
+    The input must always be 37-dim (full with EEF, normalized).
+
+    Args:
+        proprio: (B, 37) tensor from extract + normalize.
+        raw_state_256: (B, 256) original observation.state when extra base keys are used.
+        base_keys: Fields for base_only / shuffled_base_only / state_only_base.
+        noise_std: scale for random_noise_full_proprio_same_arch (Gaussian).
+    """
+    if mode == "image_only":
+        return None
+
+    if mode in ("base_only", "shuffled_base_only", "state_only_base"):
+        selected = build_base_proprio_vector_torch(proprio, raw_state_256, base_keys)
+        if mode.startswith("shuffled_"):
+            return _shuffle_batch(selected, seed, rng)
+        return selected
+
+    dims = _MODE_DIMS.get(mode)
+    if dims is None:
+        raise ValueError(f"Unknown ablation mode: {mode}")
+
+    selected = proprio[..., dims]  # (B, D')
+
+    if mode.startswith("zero_"):
+        return torch.zeros_like(selected)
+
+    if mode == "random_noise_full_proprio_same_arch":
+        g = rng
+        if g is None:
+            g = torch.Generator(device=proprio.device)
+            g.manual_seed(seed)
+        return torch.randn(
+            selected.shape,
+            device=proprio.device,
+            dtype=selected.dtype,
+            generator=g,
+        ) * float(noise_std)
+
+    if mode.startswith("shuffled_"):
+        return _shuffle_batch(selected, seed, rng)
+
+    return selected
