@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import copy
+import csv
 import glob
 import json
 import math
@@ -42,6 +43,32 @@ from .proprio import (
     parse_base_proprio_keys,
 )
 from .vis import visualize_predictions
+
+
+def _append_metrics_csv(csv_path, step, train_loss=None, val_loss=None, val_l1=None):
+    """Append one row to a local ``logs/metrics.csv``.
+
+    Mirrors the schema written by ACT's Lightning CSVLogger (and
+    ``fetch_wandb_metrics.py``) so ``build_all_checkpoints_json.py`` can read
+    GCBC train/val loss the same way it reads ACT's -- no wandb round-trip
+    needed for the eval plots. Train rows (logged frequently) and val rows
+    (logged at eval cadence) are written separately, leaving the other columns
+    blank; the builder collects each metric series independently. Creates the
+    file + header on first call.
+    """
+    header = ["step", "train/loss", "val/loss", "val/l1"]
+    write_header = not os.path.exists(csv_path)
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(header)
+        writer.writerow([
+            int(step),
+            "" if train_loss is None else float(train_loss),
+            "" if val_loss is None else float(val_loss),
+            "" if val_l1 is None else float(val_l1),
+        ])
 
 
 def get_lr_schedule(optimizer, warmup_steps, decay_steps, peak_lr):
@@ -72,6 +99,10 @@ def train(args):
     if device.type == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
     os.makedirs(args.save_dir, exist_ok=True)
+    # Local train/val loss log, same schema ACT's CSVLogger writes, so the
+    # eval plotting pipeline (build_all_checkpoints_json.py) can read GCBC
+    # losses directly from <save_dir>/logs/metrics.csv.
+    metrics_csv_path = os.path.join(args.save_dir, "logs", "metrics.csv")
 
     # Ablation mode resolution
     _use_ablation = False
@@ -429,6 +460,8 @@ def train(args):
                         else "actor_loss")
             loss_val = metrics[loss_key]
             mse_val = metrics["mse"]
+            # Persist the training loss locally for the eval plots.
+            _append_metrics_csv(metrics_csv_path, step, train_loss=loss_val)
             if epoch_mode:
                 epoch = step // steps_per_epoch
                 print(f"Epoch {epoch}/{num_epochs} (step {step}): "
@@ -481,6 +514,19 @@ def train(args):
                     import wandb
                     wandb.log({f"validation/{k}": v for k, v in val_summary.items()},
                               step=step)
+                # Persist val loss (primary optimized loss) + mse for the eval
+                # plots. mse goes in the ``val/l1`` column as the secondary
+                # metric slot (GCBC has no L1; mse is the action regression
+                # error). build_all_checkpoints_json.py reads both.
+                _val_loss_key = ("ddpm_loss" if args.policy == "gc_ddpm_bc"
+                                 else "total_loss" if args.policy == "gc_iql"
+                                 else "actor_loss")
+                _append_metrics_csv(
+                    metrics_csv_path,
+                    step,
+                    val_loss=val_summary.get(_val_loss_key),
+                    val_l1=val_summary.get("mse"),
+                )
 
             # Visualization (skip for ablation modes to avoid complexity)
             if vis_trajs and not _use_ablation:
