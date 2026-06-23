@@ -124,13 +124,21 @@ def _add_goals(traj):
     return traj
 
 
-def _add_obs_history(traj, obs_horizon):
+def _add_obs_history(traj, obs_horizon, obs_history_stride=1):
     """Stack the past ``obs_horizon`` frames (incl. current) per timestep.
 
     Operates on an intact trajectory (before ``unbatch``), since the post-
     unbatch shuffle destroys temporal adjacency. For each timestep ``t`` we
-    gather observation frames ``[t-obs_horizon+1, ..., t]`` (oldest first),
-    clamping negative indices to 0 so episode starts repeat the first frame.
+    gather observation frames ``[t-(obs_horizon-1)*stride, ..., t-stride, t]``
+    (oldest first), clamping negative indices to 0 so episode starts repeat the
+    first frame.
+
+    ``obs_history_stride`` controls the temporal *spacing* between stacked
+    frames (in original timesteps). At the native data rate, consecutive
+    frames (stride 1) can be only milliseconds apart and nearly identical;
+    a larger stride spreads the window over a behaviorally meaningful span
+    (e.g. stride 3 at 30 Hz -> 100 ms between frames). The window covers
+    ``(obs_horizon - 1) * stride + 1`` timesteps.
 
     Shapes:
         observations/image:   (T, H, W, 3) -> (T, obs_horizon, H, W, 3)
@@ -141,8 +149,10 @@ def _add_obs_history(traj, obs_horizon):
     concept for the GCBC policy).
     """
     T = tf.shape(traj["observations"]["image"])[0]
-    # (T, obs_horizon) index matrix of clamped past-frame indices.
-    offsets = tf.range(-obs_horizon + 1, 1)  # [-(H-1), ..., -1, 0]
+    # (T, obs_horizon) index matrix of clamped, stride-spaced past indices.
+    offsets = tf.range(
+        -(obs_horizon - 1) * obs_history_stride, 1, obs_history_stride
+    )  # [-(H-1)*s, ..., -s, 0]
     idx = tf.range(T)[:, tf.newaxis] + offsets[tf.newaxis, :]
     idx = tf.maximum(idx, 0)
 
@@ -197,7 +207,7 @@ def build_tf_dataset(tfrecord_paths, batch_size, seed, train=True,
                      normalize_proprio=False,
                      image_encoding="jpeg",
                      force_full_proprio=False,
-                     obs_horizon=1):
+                     obs_horizon=1, obs_history_stride=1):
     """Build a tf.data.Dataset that yields batches of transitions.
 
     Returns batches as numpy arrays (to be converted to PyTorch tensors).
@@ -205,6 +215,8 @@ def build_tf_dataset(tfrecord_paths, batch_size, seed, train=True,
     When ``obs_horizon > 1``, each transition's ``obs_image`` / ``obs_proprio``
     is a stack of the latest ``obs_horizon`` frames (see ``_add_obs_history``),
     yielding shapes ``(B, obs_horizon, H, W, 3)`` / ``(B, obs_horizon, P)``.
+    ``obs_history_stride`` spaces those frames out in original timesteps so the
+    window spans a meaningful duration rather than near-identical frames.
     """
     from functools import partial
 
@@ -241,7 +253,7 @@ def build_tf_dataset(tfrecord_paths, batch_size, seed, train=True,
     # Stack observation history (before unbatch, while trajectories are intact)
     if obs_horizon > 1:
         dataset = dataset.map(
-            lambda t: _add_obs_history(t, obs_horizon),
+            lambda t: _add_obs_history(t, obs_horizon, obs_history_stride),
             num_parallel_calls=tf.data.AUTOTUNE)
 
     # Unbatch trajectories into transitions

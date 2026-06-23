@@ -177,7 +177,8 @@ class GCBCPolicy(nn.Module):
                  hidden_dims=(256, 256, 256), dropout_rate=0.1,
                  encoder="resnetv1-34-bridge", encoder_model_name_or_path=None,
                  train_encoder=False, load_pretrained_weights=True,
-                 encoder_config_dict=None, use_image=True, obs_horizon=1):
+                 encoder_config_dict=None, use_image=True, obs_horizon=1,
+                 obs_horizon_stride=1):
         super().__init__()
         self.action_dim = action_dim
         self.use_proprio = use_proprio
@@ -188,6 +189,11 @@ class GCBCPolicy(nn.Module):
         # reproduces the original single-frame model exactly (same channel
         # counts / state_dict shapes), so old checkpoints still load.
         self.obs_horizon = obs_horizon
+        # Temporal spacing (in original timesteps) between stacked frames. Does
+        # not change the architecture -- the model still sees obs_horizon
+        # frames -- but it's recorded here so eval / vis reconstruct the same
+        # spaced window the model was trained on.
+        self.obs_horizon_stride = obs_horizon_stride
 
         if not use_image:
             encoder_out_dim = 0
