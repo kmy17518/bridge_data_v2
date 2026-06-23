@@ -98,13 +98,17 @@ class TorchGCBCEvalPolicy:
             proprio_dim = ablation_proprio_dim(proprio_ablation_mode, self._base_keys)
         policy_type = ckpt_args.get("policy", "gcbc")
 
-        # Observation-history length the checkpoint was trained with. The
-        # rollout maintains a rolling buffer of the latest ``obs_horizon``
-        # frames (and proprio) so deployment matches the stacked-frame input
-        # the model expects. Defaults to 1 (single frame) for old checkpoints.
+        # Observation-history length + temporal stride the checkpoint was
+        # trained with. The rollout maintains a rolling buffer covering the
+        # full spaced window (``(obs_horizon-1)*stride + 1`` raw frames) and
+        # samples ``obs_horizon`` frames spaced by ``stride`` so deployment
+        # matches the stacked-frame input the model expects. Defaults to a
+        # single consecutive frame for old checkpoints.
         self.obs_horizon = int(ckpt_args.get("obs_horizon", 1))
-        self._obs_hist = deque(maxlen=self.obs_horizon)
-        self._proprio_hist = deque(maxlen=self.obs_horizon)
+        self.obs_horizon_stride = int(ckpt_args.get("obs_history_stride", 1))
+        self._hist_window = (self.obs_horizon - 1) * self.obs_horizon_stride + 1
+        self._obs_hist = deque(maxlen=self._hist_window)
+        self._proprio_hist = deque(maxlen=self._hist_window)
 
         if policy_type == "gc_iql":
             self.model = GCIQLPolicy(
@@ -143,6 +147,7 @@ class TorchGCBCEvalPolicy:
                 encoder_config_dict=encoder_config_dict,
                 use_image=_ablation_use_image_flag,
                 obs_horizon=self.obs_horizon,
+                obs_horizon_stride=self.obs_horizon_stride,
             ).to(self.device)
             self.model.load_state_dict(ckpt["model_state_dict"])
             self.target_state_dict = None
@@ -156,6 +161,19 @@ class TorchGCBCEvalPolicy:
         elif use_proprio:
             print(f"  Proprio: {proprio_dim}-dim (add_eef={add_eef_proprio}, "
                   f"normalize={normalize_proprio})")
+
+    def _stack_history(self, hist: deque) -> np.ndarray:
+        """Assemble the stacked-frame input from a rolling raw-frame buffer.
+
+        Left-pads by repeating the earliest available frame to fill the full
+        ``(obs_horizon-1)*stride + 1`` window (episode start), then samples
+        ``obs_horizon`` frames spaced by ``stride`` (oldest first, current
+        last). Returns an array of shape ``(obs_horizon, ...)``.
+        """
+        buf = list(hist)
+        buf = [buf[0]] * (self._hist_window - len(buf)) + buf
+        frames = buf[:: self.obs_horizon_stride]  # length obs_horizon, current last
+        return np.stack(frames, axis=0)
 
     def forward(self, obs, *args, **kwargs):
         """Policy interface for eval_ispatialgym.py.
@@ -190,10 +208,8 @@ class TorchGCBCEvalPolicy:
         goal_t = torch.from_numpy(self.goal_image[np.newaxis]).to(self.device)
         if self.obs_horizon > 1:
             self._obs_hist.append(obs_image)
-            frames = list(self._obs_hist)
-            frames = [frames[0]] * (self.obs_horizon - len(frames)) + frames
             obs_t = torch.from_numpy(
-                np.stack(frames, axis=0)[np.newaxis]).to(self.device)
+                self._stack_history(self._obs_hist)[np.newaxis]).to(self.device)
         else:
             obs_t = torch.from_numpy(obs_image[np.newaxis]).to(self.device)
 
@@ -253,10 +269,8 @@ class TorchGCBCEvalPolicy:
         # Stack proprio history to match the model's expected (1, T, P) input.
         if self.obs_horizon > 1 and proprio_t is not None:
             self._proprio_hist.append(proprio_t.squeeze(0).detach().cpu().numpy())
-            ph = list(self._proprio_hist)
-            ph = [ph[0]] * (self.obs_horizon - len(ph)) + ph
             proprio_t = torch.from_numpy(
-                np.stack(ph, axis=0)[np.newaxis]).to(self.device)
+                self._stack_history(self._proprio_hist)[np.newaxis]).to(self.device)
 
         # Run inference
         with torch.no_grad():

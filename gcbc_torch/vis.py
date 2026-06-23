@@ -47,10 +47,13 @@ def run_trajectory_inference(model, traj, device,
         proprio = np.zeros((T, action_dim), dtype=np.float32)
 
     # Window observation history (oldest first, clamped at episode start) to
-    # match the stacked-frame input the model was trained with.
+    # match the stacked-frame input the model was trained with, including the
+    # temporal stride used during training.
     obs_horizon = getattr(model, "obs_horizon", 1)
+    obs_stride = getattr(model, "obs_horizon_stride", 1)
     if obs_horizon > 1:
-        idx = np.arange(T)[:, None] + np.arange(-obs_horizon + 1, 1)[None, :]
+        offsets = np.arange(-(obs_horizon - 1) * obs_stride, 1, obs_stride)
+        idx = np.arange(T)[:, None] + offsets[None, :]
         idx = np.clip(idx, 0, T - 1)
         obs_images = obs_images[idx]   # (T, obs_horizon, H, W, 3)
         proprio = proprio[idx]         # (T, obs_horizon, P)

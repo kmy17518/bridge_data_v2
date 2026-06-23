@@ -113,6 +113,7 @@ def train(args):
         "encoder_model_name_or_path": args.encoder_model_name_or_path,
         "train_encoder": args.train_encoder,
         "obs_horizon": args.obs_horizon,
+        "obs_history_stride": args.obs_history_stride,
         "batch_size": args.batch_size,
         "lr": args.lr,
         "warmup_steps": args.warmup_steps,
@@ -172,6 +173,7 @@ def train(args):
         image_encoding=image_encoding,
         force_full_proprio=_use_ablation,
         obs_horizon=args.obs_horizon,
+        obs_history_stride=args.obs_history_stride,
     )
 
     val_dataset = build_tf_dataset(
@@ -182,6 +184,7 @@ def train(args):
         image_encoding=image_encoding,
         force_full_proprio=_use_ablation,
         obs_horizon=args.obs_horizon,
+        obs_history_stride=args.obs_history_stride,
     )
 
     # Load vis trajectories
@@ -213,6 +216,7 @@ def train(args):
             image_encoding=image_encoding,
             force_full_proprio=_use_ablation,
             obs_horizon=args.obs_horizon,
+            obs_history_stride=args.obs_history_stride,
         )
     else:
         total_steps = args.num_steps or 100000
@@ -298,6 +302,7 @@ def train(args):
             encoder_config_dict=encoder_config_dict,
             use_image=_use_image,
             obs_horizon=args.obs_horizon,
+            obs_horizon_stride=args.obs_history_stride,
         ).to(device)
 
     n_total = sum(p.numel() for p in model.parameters())
@@ -556,9 +561,17 @@ def main():
                         help="Number of stacked observation frames (incl. current) "
                              "fed to the policy. 1 = single-frame (original "
                              "behavior, the default baseline); >1 gives the policy "
-                             "temporal history (e.g. 4 = ~0.4s at the 10Hz "
-                             "downsampled rate). Currently only supported with "
-                             "--policy gcbc.")
+                             "temporal history (e.g. 8). Currently only supported "
+                             "with --policy gcbc.")
+    parser.add_argument("--obs_history_stride", type=int, default=1,
+                        help="Temporal spacing (in original timesteps) between the "
+                             "stacked observation-history frames. 1 = consecutive "
+                             "frames (which at the native rate can be only "
+                             "milliseconds apart and nearly identical); a larger "
+                             "stride spreads the window over a meaningful span "
+                             "(e.g. 3 at 30Hz => 100ms between frames, so "
+                             "obs_horizon=8 covers ~0.7s). Only meaningful with "
+                             "--obs_horizon > 1.")
 
     parser.add_argument("--num_steps", type=int, default=None,
                         help="Total training steps (step mode, default)")
@@ -641,6 +654,15 @@ def main():
             "--obs_horizon > 1 is not supported together with "
             "--proprio_ablation_mode (the ablation transforms expect a single "
             "proprio frame). Use obs_horizon=1 for ablation studies."
+        )
+    if args.obs_history_stride < 1:
+        raise ValueError(
+            f"--obs_history_stride must be >= 1, got {args.obs_history_stride}."
+        )
+    if args.obs_history_stride > 1 and args.obs_horizon == 1:
+        print(
+            "WARNING: --obs_history_stride > 1 has no effect when "
+            "--obs_horizon == 1 (single frame). Ignoring stride."
         )
     train(args)
 
